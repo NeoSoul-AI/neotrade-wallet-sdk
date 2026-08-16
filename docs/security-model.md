@@ -34,4 +34,4 @@ What this SDK guarantees, what the consuming host is responsible for, and where 
 
 Runtime dependencies across all three packages: `@noble/curves`, `@noble/hashes`, `@scure/bip32`, `@scure/bip39`, `zod`, `viem`, `@x402/evm` (pinned exact). `pnpm-lock.yaml` is committed.
 
-Source-only ESM: `exports` point at `src/index.ts`; there is no build step and no published artifact — consumers install a tagged git commit, and pnpm pins the commit SHA in their lockfile.
+Source-only ESM: `exports` point at `src/index.ts`; there is no build step.
