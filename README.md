@@ -5,7 +5,7 @@ The wallet and key-security core of [neotrade](https://github.com/NeoSoul-AI/neo
 | Package | What it is |
 |---|---|
 | `@neotrade/wallet` | BIP-39 mnemonic generation, BIP-32 derivation with role/path separation (`m/44'/60'/N'/0/0`), scrypt+AES-256-GCM encrypted keystore, mnemonic backup verification, EIP-191 personal-message signing. Deps: @noble/curves, @noble/hashes, @scure/bip32, @scure/bip39 only. |
-| `@neotrade/signing-gateway` | The policy gate every order intent passes before anything downstream acts on it: schema-validated structured orders only (no raw-hash API exists), fail-closed per-agent caps and market allowlists, time-limited sessions, idempotent authorization, an append-only log of every decision. **Not a cryptographic signing boundary** — the venue's EIP-712 signature is produced by the consuming host's venue executor. Deps: zod only. |
+| `@neotrade/signing-gateway` | The policy gate every order intent passes before anything downstream acts on it: schema-validated structured orders only (no raw-hash API exists), fail-closed per-agent authorization and market allowlists, time-limited sessions, idempotent authorization, an append-only log of every decision. Order SIZING is deliberately not enforced here — judging it needs trading context this package does not have, so it belongs to the consuming host. **Not a cryptographic signing boundary** — the venue's EIP-712 signature is produced by the consuming host's venue executor. Deps: zod only. |
 | `@neotrade/x402` | Generic EVM chain primitives that take a raw private key: balances, Permit2, ERC-20/native transfers, x402 payment. Deps: viem, @x402/evm. |
 
 The three packages are mutually independent — no cross-references.

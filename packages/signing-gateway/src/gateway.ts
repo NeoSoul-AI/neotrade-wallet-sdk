@@ -19,6 +19,10 @@ import { z } from "zod";
  *   *different* order content is rejected as a conflict — retry loops
  *   upstream (bus, provider) can never double-spend here.
  * - **Auditable.** Every request leaves an audit entry, signed or refused.
+ *
+ * Every one of those is decidable WITHOUT knowing what a trade MEANS. That is
+ * the line this package holds: structure, identity, session, allowlist and
+ * exactly-once live here; sizing, pricing and risk live in the consuming host.
  */
 
 /**
@@ -29,6 +33,18 @@ import { z } from "zod";
  * `orderType` is per-order (was a submitter-constructor field) and defaults
  * per-side so pre-existing BUY callers keep working (GTC), while exits default
  * to a marketable FAK.
+ *
+ * SIZING IS NOT POLICY HERE (2026-08-16). Quantity and price are carried for
+ * schema validation, idempotency hashing and audit only — this gate never
+ * compares them against a money threshold. A USD threshold cannot be applied
+ * correctly without knowing what the order MEANS: a BUY adds exposure and a
+ * SELL removes it, so a single shared cap reads as risk control in one
+ * direction and as a capital trap in the other (found live 2026-08-16: a
+ * position that appreciated past the cap could no longer be sold, because the
+ * cap was compared against `shares * priceUsd`). Direction semantics belong to
+ * the trading domain, which docs/security-model.md assigns to the consuming
+ * host — so the cap belongs there too, next to the bankroll, the venue minimum
+ * and the live book it has to be reconciled against.
  */
 export const OrderIntentSchema = z.discriminatedUnion("side", [
   z
@@ -41,17 +57,9 @@ export const OrderIntentSchema = z.discriminatedUnion("side", [
       outcome: z.enum(["YES", "NO"]),
       /** Prediction-market share price, strictly inside (0, 1). */
       priceUsd: z.number().gt(0).lt(1),
-      /** BUY: order notional in USD. */
+      /** BUY: order notional in USD. Carried for idempotency and audit; never
+       * compared against a policy threshold here (see the sizing note above). */
       sizeUsd: z.number().positive().finite(),
-      /**
-       * The sizing floor the caller raised sizeUsd to meet — max(the venue's
-       * minimum order, the operator's configured minOrderUsd). Lets the order
-       * through the per-order cap up to EXACTLY this floor (operator
-       * decision, 2026-07-29: the sizing floor outranks the sizing caps).
-       * Caller-supplied at the same trust level as priceUsd (see the cap
-       * comment below) and part of the signed, hashed, audited content.
-       */
-      sizeFloorUsd: z.number().positive().finite().optional(),
       orderType: z.enum(["GTC", "FAK"]).default("GTC"),
     })
     .strict(),
@@ -76,8 +84,6 @@ export type OrderIntent = z.infer<typeof OrderIntentSchema>;
 
 export interface AgentSigningAuthorization {
   agentId: string;
-  /** Hard per-order cap; the pipeline's soft caps live upstream. */
-  maxOrderUsd: number;
   /** Restrict to specific markets; absent means any market. */
   allowedMarkets?: readonly string[];
   /** Unix ms after which this authorization is dead. */
@@ -99,7 +105,6 @@ export type SignRejectionCode =
   | "unauthorized_agent"
   | "authorization_expired"
   | "market_not_allowed"
-  | "over_limit"
   | "idempotency_conflict";
 
 export interface AuditEntry {
@@ -220,22 +225,12 @@ export class SigningGateway {
     if (authorization.allowedMarkets && !authorization.allowedMarkets.includes(order.market)) {
       return this.reject(order, "market_not_allowed", `market ${order.market} not in allowlist`);
     }
-    // Per-order cap is USD-denominated. BUY caps its notional directly; SELL
-    // caps the estimated proceeds `shares * priceUsd` (the gateway trusts the
-    // caller's priceUsd, the same trust level as the BUY path — no external
-    // price lookup happens here). A BUY's sizeFloorUsd raises the cap to at
-    // least the declared sizing floor — a floor for the cap, never a waiver:
-    // anything above BOTH still rejects.
-    const orderUsd = order.side === "BUY" ? order.sizeUsd : order.shares * order.priceUsd;
-    const orderCap = Math.max(
-      authorization.maxOrderUsd,
-      order.side === "BUY" ? (order.sizeFloorUsd ?? 0) : 0,
-    );
-    if (orderUsd > orderCap) {
-      return this.reject(order, "over_limit", `order size ${orderUsd} exceeds per-order cap ${orderCap}`);
-    }
+    // NO SIZE CHECK HERE, BY DESIGN (see OrderIntentSchema's sizing note). The
+    // per-order USD cap this gate used to enforce now has exactly one owner:
+    // the host's order executor, which resolves sizing with the context this
+    // gate lacks (side, bankroll, venue minimum, live book).
 
-    const idempotencyKey = `${order.agentId} ${order.clientOrderId}`;
+    const idempotencyKey = `${order.agentId} ${order.clientOrderId}`;
     const orderHash = hashOrder(order);
     const existing = this.signedOrders.get(idempotencyKey);
     if (existing) {
@@ -311,9 +306,6 @@ function hashOrder(order: OrderIntent): string {
     order.priceUsd,
     quantity,
     order.orderType,
-    // BUY-only cap floor; null keeps the slot fixed-width so its absence is
-    // itself canonical (a replay that adds or changes the floor conflicts).
-    order.side === "BUY" ? (order.sizeFloorUsd ?? null) : null,
   ]);
   return createHash("sha256").update(canonical).digest("hex");
 }

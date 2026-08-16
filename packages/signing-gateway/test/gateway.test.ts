@@ -8,7 +8,6 @@ type BuyOverrides = Partial<{
   outcome: "YES" | "NO";
   priceUsd: number;
   sizeUsd: number;
-  sizeFloorUsd: number;
   orderType: "GTC" | "FAK";
 }>;
 
@@ -28,7 +27,7 @@ function makeGateway(): SigningGateway {
   clock = 1_000_000;
   const gateway = new SigningGateway({ signer: new PolicyStampSigner(), now: () => clock });
   gateway.unlock({ ttlMs: 60 * 60 * 1000 });
-  gateway.authorizeAgent({ agentId: "a1", maxOrderUsd: 100 });
+  gateway.authorizeAgent({ agentId: "a1" });
   return gateway;
 }
 
@@ -126,7 +125,7 @@ describe("SigningGateway", () => {
 
   it("expires per-agent authorizations", async () => {
     const gateway = makeGateway();
-    gateway.authorizeAgent({ agentId: "a2", maxOrderUsd: 100, expiresAt: clock + 1_000 });
+    gateway.authorizeAgent({ agentId: "a2", expiresAt: clock + 1_000 });
     expect(await gateway.signOrder(order({ agentId: "a2" }))).toMatchObject({ ok: true });
     clock += 1_000;
     expect(
@@ -134,62 +133,45 @@ describe("SigningGateway", () => {
     ).toMatchObject({ ok: false, code: "authorization_expired" });
   });
 
-  it("enforces market allowlists and per-order caps", async () => {
+  it("enforces market allowlists", async () => {
     const gateway = makeGateway();
     gateway.authorizeAgent({
       agentId: "a3",
-      maxOrderUsd: 50,
       allowedMarkets: ["market-x"],
     });
     expect(
       await gateway.signOrder(order({ agentId: "a3", market: "market-y" })),
     ).toMatchObject({ ok: false, code: "market_not_allowed" });
     expect(
-      await gateway.signOrder(order({ agentId: "a3", sizeUsd: 51 })),
-    ).toMatchObject({ ok: false, code: "over_limit" });
-    expect(
-      await gateway.signOrder(order({ agentId: "a3", sizeUsd: 50 })),
+      await gateway.signOrder(order({ agentId: "a3", market: "market-x" })),
     ).toMatchObject({ ok: true });
   });
 
-  it("a BUY carrying sizeFloorUsd may reach exactly that floor past maxOrderUsd", async () => {
-    // Operator decision (2026-07-29): the venue's minimum order outranks the
-    // per-order cap — an agent capped at $2 must still be able to place the
-    // $3.77 minimum the venue demands. The floor comes from the signed intent
-    // itself (the same trust level as priceUsd, see the cap comment), so it
-    // is audited with the order.
+  it("does not police order size in either direction (2026-08-16: sizing is the host's)", async () => {
+    // The gateway used to hold a USD per-order cap, comparing sizeUsd on a BUY
+    // and `shares * priceUsd` on a SELL. That could not be right here: this
+    // package cannot see side semantics, bankroll, the venue minimum or the
+    // live book, so one shared number read as risk control on the way in and
+    // as a capital trap on the way out — a position that appreciated past the
+    // cap became unsellable (found live). Sizing now has exactly one owner,
+    // the host's order executor. What this gate must NOT do is re-introduce a
+    // second opinion about size, so both directions are asserted.
     const gateway = makeGateway();
-    gateway.authorizeAgent({ agentId: "a4", maxOrderUsd: 2 });
+    expect(await gateway.signOrder(order({ sizeUsd: 1_000_000 }))).toMatchObject({ ok: true });
     expect(
-      await gateway.signOrder(order({ agentId: "a4", sizeUsd: 3.77, sizeFloorUsd: 3.77 })),
+      await gateway.signOrder(sellOrder({ clientOrderId: "c-sell-big", shares: 1_000_000, priceUsd: 0.99 })),
     ).toMatchObject({ ok: true });
   });
 
-  it("sizeFloorUsd is a floor for the cap, never a waiver: sizes above BOTH still reject", async () => {
+  it("an unknown field is still a structural rejection (sizeFloorUsd was retired with the cap)", async () => {
+    // The floor existed only to lift the cap. With the cap gone the field has
+    // no meaning here, and `.strict()` must reject it rather than ignore it —
+    // otherwise a stale caller keeps sending sizing hints this gate silently
+    // drops, which is exactly how a policy ends up with two owners again.
     const gateway = makeGateway();
-    gateway.authorizeAgent({ agentId: "a4", maxOrderUsd: 2 });
     expect(
-      await gateway.signOrder(order({ agentId: "a4", sizeUsd: 5, sizeFloorUsd: 3.77 })),
-    ).toMatchObject({ ok: false, code: "over_limit" });
-  });
-
-  it("without sizeFloorUsd the per-order cap is unchanged", async () => {
-    const gateway = makeGateway();
-    gateway.authorizeAgent({ agentId: "a4", maxOrderUsd: 2 });
-    expect(await gateway.signOrder(order({ agentId: "a4", sizeUsd: 3.77 }))).toMatchObject({
-      ok: false,
-      code: "over_limit",
-    });
-  });
-
-  it("sizeFloorUsd is part of the signed content: a replay with a different floor is an idempotency conflict", async () => {
-    const gateway = makeGateway();
-    const first = await gateway.signOrder(order({ sizeUsd: 10, sizeFloorUsd: 3.77 }));
-    expect(first).toMatchObject({ ok: true, replay: false });
-    expect(await gateway.signOrder(order({ sizeUsd: 10, sizeFloorUsd: 9.99 }))).toMatchObject({
-      ok: false,
-      code: "idempotency_conflict",
-    });
+      await gateway.signOrder({ ...order({ sizeUsd: 10 }), sizeFloorUsd: 3.77 }),
+    ).toMatchObject({ ok: false, code: "invalid_request" });
   });
 
   it("structurally refuses anything that is not a well-formed order", async () => {
@@ -267,16 +249,13 @@ describe("SigningGateway", () => {
     expect(result).toMatchObject({ ok: true, replay: false, clientOrderId: "s-1" });
   });
 
-  it("enforces the per-order cap on a SELL against shares * priceUsd", async () => {
+  it("signs a SELL whose proceeds would have blown the retired cap", async () => {
+    // The exact shape that failed in production on 2026-08-16: an appreciated
+    // position worth ~$906 under a $500 cap. `shares * priceUsd` is no longer
+    // computed here at all, so the close goes through.
     const gateway = makeGateway();
-    gateway.authorizeAgent({ agentId: "a3", maxOrderUsd: 50 });
-    // 100 shares * 0.62 = 62 USD-equivalent > 50 cap.
     expect(
-      await gateway.signOrder(sellOrder({ agentId: "a3", shares: 100, priceUsd: 0.62 })),
-    ).toMatchObject({ ok: false, code: "over_limit" });
-    // 80 shares * 0.62 = 49.6 <= 50 cap.
-    expect(
-      await gateway.signOrder(sellOrder({ agentId: "a3", shares: 80, priceUsd: 0.62 })),
+      await gateway.signOrder(sellOrder({ shares: 1041.76, priceUsd: 0.87 })),
     ).toMatchObject({ ok: true });
   });
 
