@@ -1,0 +1,26 @@
+{
+  "name": "@neotrade/x402",
+  "version": "0.1.0",
+  "description": "x402 / Permit2 payment client for buying house-account credit — the ONLY package outside executor-polymarket allowed to import viem, and the only one allowed to import @x402/*",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@x402/evm": "2.21.0",
+    "viem": "^2.54.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  }
+}

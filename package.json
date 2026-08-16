@@ -1,0 +1,15 @@
+{
+  "name": "neotrade-wallet-sdk",
+  "private": true,
+  "version": "0.0.0",
+  "description": "neotrade wallet SDK: key derivation and encrypted keystore, order-signing policy gate, and raw-key chain primitives for the neotrade runtime",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@10.29.3",
+  "scripts": {
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  }
+}
