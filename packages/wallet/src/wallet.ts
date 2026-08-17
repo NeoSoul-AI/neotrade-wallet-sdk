@@ -24,7 +24,6 @@ import {
 
 export interface WalletKeys {
   trading: DerivedKey;
-  proof: DerivedKey;
   /** walletIndex → venue trading key; always contains 0 (≡ trading). */
   wallets: Map<number, DerivedKey>;
 }
@@ -92,8 +91,8 @@ export function importWalletDirect(mnemonic: string, passphrase: string): Encryp
   return encryptSecret(normalized, passphrase);
 }
 
-/** Unlock: decrypt the keystore and derive both fixed keys plus every
- * requested venue-wallet index (the mnemonic never leaves this call). */
+/** Unlock: decrypt the keystore and derive every requested venue-wallet
+ * index (the mnemonic never leaves this call). */
 export function unlockWallet(
   keystore: EncryptedKeystore,
   passphrase: string,

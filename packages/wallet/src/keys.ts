@@ -7,35 +7,35 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
 /**
  * Key derivation for the neotrade local wallet.
  *
- * Three-key separation (spec §wallet): the owner main wallet never enters
- * neotrade. neotrade holds two derived keys, and even in the MVP they are at
- * least logically separated by derivation path so that a leaked proof key
- * cannot move funds:
- *   - trading key  (m/44'/60'/0'/0/0) — signs CLOB orders only
- *   - proof signer (m/44'/60'/0'/0/1) — signs observations / proofs only
- * Both are derived from one mnemonic but live at different paths / key ids.
+ * Wallets live on the standard EVM ADDRESS axis — the same one MetaMask
+ * enumerates — so wallet N is byte-identical to MetaMask account #N+1 from
+ * the same mnemonic:
+ *   wallet N: m/44'/60'/0'/0/N
+ * The owner can import the mnemonic into MetaMask (or vice versa) and see
+ * exactly the same addresses in the same order; nothing here is reachable
+ * only through neotrade.
+ *
+ * History: wallets 1+ briefly derived on the hardened ACCOUNT axis
+ * (m/44'/60'/N'/0/0), and m/44'/60'/0'/0/1 was a dedicated "proof signer"
+ * role. Both are retired — wallet 0 never moved, no account-axis wallet
+ * beyond 0 ever shipped to a real deployment, and the old proof-signer path
+ * is exactly today's wallet 1 (the host uses that identity for legacy
+ * house-account sign-in until those accounts re-key to wallet 0).
  */
 
-export type Role = "trading" | "proof";
-
-const DERIVATION_PATH: Record<Role, string> = {
-  trading: "m/44'/60'/0'/0/0",
-  proof: "m/44'/60'/0'/0/1",
-};
-
-/** Hardened-derivation bound (BIP-32): indexes 0..2^31-1. */
+/** Non-hardened derivation bound (BIP-32): indexes 0..2^31-1. */
 export const MAX_WALLET_INDEX = 0x7fffffff;
 
-/** Wallet N's venue trading key path — the hardened BIP-44 ACCOUNT axis.
- * Wallet 0 is byte-identical to the legacy trading path. */
+/** Wallet N's venue trading key path — the standard EVM ADDRESS axis,
+ * matching MetaMask account #N+1 from the same mnemonic. */
 export function tradingPathForIndex(walletIndex: number): string {
   if (!Number.isInteger(walletIndex) || walletIndex < 0 || walletIndex > MAX_WALLET_INDEX) {
     throw new Error(`walletIndex must be an integer in [0, ${MAX_WALLET_INDEX}]`);
   }
-  return `m/44'/60'/${walletIndex}'/0/0`;
+  return `m/44'/60'/0'/0/${walletIndex}`;
 }
 
-/** Derives wallet N's venue trading key. Index 0 ≡ deriveKey(mnemonic, "trading"). */
+/** Derives wallet N's venue trading key. */
 export function deriveTradingKeyForIndex(mnemonic: string, walletIndex: number): DerivedKey {
   const path = tradingPathForIndex(walletIndex);
   const normalized = mnemonic.trim();
@@ -47,11 +47,10 @@ export function deriveTradingKeyForIndex(mnemonic: string, walletIndex: number):
   if (!node.privateKey) {
     throw new Error(`no private key at path ${path}`);
   }
-  return { role: "trading", privateKey: hex0x(node.privateKey), address: addressFromPrivateKey(node.privateKey) };
+  return { privateKey: hex0x(node.privateKey), address: addressFromPrivateKey(node.privateKey) };
 }
 
 export interface DerivedKey {
-  role: Role;
   privateKey: `0x${string}`;
   address: `0x${string}`;
 }
@@ -63,21 +62,6 @@ export function generateWalletMnemonic(): string {
 
 export function isValidMnemonic(mnemonic: string): boolean {
   return validateMnemonic(mnemonic.trim(), wordlist);
-}
-
-/** Derives one role's key from a mnemonic. Throws on an invalid mnemonic. */
-export function deriveKey(mnemonic: string, role: Role): DerivedKey {
-  const normalized = mnemonic.trim();
-  if (!validateMnemonic(normalized, wordlist)) {
-    throw new Error("invalid mnemonic");
-  }
-  const seed = mnemonicToSeedSync(normalized);
-  const node = HDKey.fromMasterSeed(seed).derive(DERIVATION_PATH[role]);
-  if (!node.privateKey) {
-    throw new Error(`no private key at path ${DERIVATION_PATH[role]}`);
-  }
-  const privateKey = hex0x(node.privateKey);
-  return { role, privateKey, address: addressFromPrivateKey(node.privateKey) };
 }
 
 const HEX = "0123456789abcdef";
@@ -119,19 +103,19 @@ function addressFromPrivateKey(privateKey: Uint8Array): `0x${string}` {
   return addressFromUncompressedPublicKey(secp256k1.getPublicKey(privateKey, false));
 }
 
-/** Derives both fixed neotrade keys plus every requested venue-wallet key.
- * `wallets` always contains index 0 (≡ trading). The owner key is never
- * derived here. */
+/** Derives every requested venue-wallet key. `wallets` always contains
+ * index 0 (≡ trading — the same object). The owner key is never derived
+ * here. */
 export function deriveWalletKeys(
   mnemonic: string,
   walletIndexes: readonly number[] = [],
-): { trading: DerivedKey; proof: DerivedKey; wallets: Map<number, DerivedKey> } {
-  const trading = deriveKey(mnemonic, "trading");
+): { trading: DerivedKey; wallets: Map<number, DerivedKey> } {
+  const trading = deriveTradingKeyForIndex(mnemonic, 0);
   const wallets = new Map<number, DerivedKey>([[0, trading]]);
   for (const index of walletIndexes) {
     if (!wallets.has(index)) {
       wallets.set(index, deriveTradingKeyForIndex(mnemonic, index));
     }
   }
-  return { trading, proof: deriveKey(mnemonic, "proof"), wallets };
+  return { trading, wallets };
 }

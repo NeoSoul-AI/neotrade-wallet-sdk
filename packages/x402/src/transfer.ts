@@ -4,8 +4,7 @@ import { chainOf } from "./permit2.js";
 import type { ChainEndpoint } from "./types.js";
 
 /**
- * Plain value transfers. Callers: the proof-funds migration ceremony
- * (`packages/sidecar/src/proof-migration.ts`) and the operator send surface
+ * Plain value transfers. Caller: the operator send surface
  * (`packages/sidecar/src/wallet-transfer.ts` — the 2026-08-12 spec supersedes
  * the §5 rejection the previous comment here recorded).
  *
@@ -150,7 +149,7 @@ export async function transferNative(
  * to `getGasPrice()` only if the chain doesn't support fee estimation (a
  * legacy, non-1559 chain), where it IS the number viem will use.
  * Over-reserving here is the safe direction: the unsent remainder stays on
- * the proof address and is still sweepable on the next run.
+ * the source address and is still sendable on the next run.
  *
  * Not unit tested — like `transferErc20`/`transferNative` above, it needs a
  * live chain response and this package draws the line at the pure calldata
