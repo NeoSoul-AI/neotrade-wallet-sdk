@@ -10,6 +10,14 @@
   "packageManager": "pnpm@10.29.3",
   "scripts": {
     "test": "pnpm -r test",
-    "typecheck": "pnpm -r typecheck"
+    "typecheck": "pnpm -r typecheck && tsc --noEmit -p tsconfig.scripts.json",
+    "probe:swap": "tsx scripts/swap-probe.mts"
+  },
+  "devDependencies": {
+    "@neotrade/x402": "workspace:*",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0",
+    "viem": "^2.54.0"
   }
 }

@@ -16,3 +16,19 @@ export {
   TransferRevertedError,
   TransferUnconfirmedError,
 } from "./transfer.js";
+export {
+  applySlippageBps,
+  applySlippageUpBps,
+  decodeSwapAmountIn,
+  decodeSwapAmountOut,
+  encodeExactInputSingle,
+  encodeExactOutMulticall,
+  encodeExactOutputSingle,
+  quoteSwapNativeForErc20,
+  quoteSwapNativeForErc20ExactOut,
+  swapNativeForErc20,
+  swapNativeForErc20ExactOut,
+  SwapRevertedError,
+  SwapUnconfirmedError,
+} from "./swap.js";
+export type { ExactOutputSingleParams } from "./swap.js";
