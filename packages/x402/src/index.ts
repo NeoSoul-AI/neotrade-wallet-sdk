@@ -16,3 +16,12 @@ export {
   TransferRevertedError,
   TransferUnconfirmedError,
 } from "./transfer.js";
+export {
+  applySlippageBps,
+  decodeSwapAmountOut,
+  encodeExactInputSingle,
+  quoteSwapNativeForErc20,
+  swapNativeForErc20,
+  SwapRevertedError,
+  SwapUnconfirmedError,
+} from "./swap.js";
