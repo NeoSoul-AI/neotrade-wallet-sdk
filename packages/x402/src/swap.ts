@@ -176,6 +176,17 @@ function assertAmountIn(amountInWei: bigint): void {
   }
 }
 
+/** The node's estimate is "exactly enough at ESTIMATION-TIME state" — with
+ * zero headroom, a same-block transaction that moves the pool (one extra
+ * initialized tick ≈ +30k gas) turns the swap into an out-of-gas revert.
+ * Proven live: tx 0x18846e...bc5212 was sent with gas == estimate (162941),
+ * consumed 158164 (limit minus two nested 1/64 retentions) and reverted with
+ * zero logs, while the identical call simulates fine. +30% is free — the
+ * unused remainder is refunded. */
+function gasWithHeadroom(estimate: bigint): bigint {
+  return (estimate * 13n) / 10n;
+}
+
 /** One eth_call against QuoterV2. Read-only, zero cost. Reverts (as a thrown
  * error) when the pool for this fee tier does not exist. */
 export async function quoteSwapNativeForErc20(
@@ -247,9 +258,12 @@ export async function swapNativeForErc20(
     amountIn: params.amountInWei,
     amountOutMinimum: params.amountOutMinimum,
   });
+  const gas = gasWithHeadroom(
+    await pc.estimateGas({ account, to: params.router, data, value: params.amountInWei }),
+  );
   // A throw ABOVE this line means nothing was broadcast: plain error, the
   // caller may record `failed` and safely retry.
-  const txHash = await wc.sendTransaction({ to: params.router, data, value: params.amountInWei });
+  const txHash = await wc.sendTransaction({ to: params.router, data, value: params.amountInWei, gas });
   let receipt: Awaited<ReturnType<typeof pc.waitForTransactionReceipt>>;
   try {
     receipt = await pc.waitForTransactionReceipt({ hash: txHash });
@@ -492,9 +506,12 @@ export async function swapNativeForErc20ExactOut(
     amountOut: params.amountOut,
     amountInMaximum: params.amountInMaximumWei,
   });
+  const gas = gasWithHeadroom(
+    await pc.estimateGas({ account, to: params.router, data, value: params.amountInMaximumWei }),
+  );
   // A throw ABOVE this line means nothing was broadcast: plain error, the
   // caller may record `failed` and safely retry.
-  const txHash = await wc.sendTransaction({ to: params.router, data, value: params.amountInMaximumWei });
+  const txHash = await wc.sendTransaction({ to: params.router, data, value: params.amountInMaximumWei, gas });
   let receipt: Awaited<ReturnType<typeof pc.waitForTransactionReceipt>>;
   try {
     receipt = await pc.waitForTransactionReceipt({ hash: txHash });
