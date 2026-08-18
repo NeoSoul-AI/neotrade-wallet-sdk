@@ -3,7 +3,6 @@ import {
   buildBackupChallenge,
   createWallet,
   decryptSecret,
-  deriveKey,
   deriveWalletKeys,
   deriveTradingKeyForIndex,
   encryptSecret,
@@ -39,16 +38,14 @@ describe("key derivation", () => {
 
   it("rejects an invalid mnemonic", () => {
     expect(isValidMnemonic("not a real mnemonic phrase")).toBe(false);
-    expect(() => deriveKey("not a real mnemonic", "trading")).toThrow("invalid mnemonic");
+    expect(() => deriveTradingKeyForIndex("not a real mnemonic", 0)).toThrow("invalid mnemonic");
   });
 
-  it("derives trading and proof keys at different paths from one mnemonic", () => {
-    const { trading, proof } = deriveWalletKeys(TEST_MNEMONIC);
-    expect(trading.role).toBe("trading");
-    expect(proof.role).toBe("proof");
-    // Logical separation: distinct keys and addresses.
-    expect(trading.privateKey).not.toBe(proof.privateKey);
-    expect(trading.address).not.toBe(proof.address);
+  it("derives distinct keys per wallet index from one mnemonic", () => {
+    const { trading, wallets } = deriveWalletKeys(TEST_MNEMONIC, [1]);
+    const w1 = wallets.get(1)!;
+    expect(trading.privateKey).not.toBe(w1.privateKey);
+    expect(trading.address).not.toBe(w1.address);
     // Address correctness against standard EVM derivation is pinned by the
     // anvil known-answer vectors below; here just assert EIP-55 shape.
     expect(trading.address).toMatch(/^0x[0-9a-fA-F]{40}$/);
@@ -128,8 +125,7 @@ describe("wallet lifecycle", () => {
     const keystore = finalizeWallet(created, answers, "a-strong-passphrase");
 
     const unlocked = unlockWallet(keystore, "a-strong-passphrase");
-    expect(unlocked.trading.address).toBe(deriveKey(created.mnemonic, "trading").address);
-    expect(unlocked.proof.address).toBe(deriveKey(created.mnemonic, "proof").address);
+    expect(unlocked.trading.address).toBe(deriveTradingKeyForIndex(created.mnemonic, 0).address);
   });
 
   it("refuses to finalize when the backup verification fails", () => {
@@ -153,33 +149,42 @@ describe("wallet lifecycle", () => {
     const answers = Object.fromEntries(imported.challenge.positions.map((p) => [p, words[p - 1]!]));
     const keystore = finalizeWallet(imported, answers, "passphrase123");
     const unlocked = unlockWallet(keystore, "passphrase123");
-    expect(unlocked.trading.address).toBe(deriveKey(TEST_MNEMONIC, "trading").address);
+    expect(unlocked.trading.address).toBe(deriveTradingKeyForIndex(TEST_MNEMONIC, 0).address);
 
     expect(() => importWallet("clearly not valid words here")).toThrow("invalid mnemonic");
   });
 });
 
-describe("deriveKey known-answer vectors (BIP-44 + EIP-55)", () => {
+describe("known-answer vectors (BIP-44 address axis + EIP-55)", () => {
   // The universally-known anvil/hardhat dev mnemonic. These vectors pin the
   // derivation paths, the private-key hex encoding, AND the EIP-55 checksum
   // casing of the address — so the address implementation can never silently
   // change (walletStatus exposes these addresses; operators compare them
-  // against venue/deposit views by eye and by string equality).
+  // against venue/deposit views by eye and by string equality). Wallet N is
+  // MetaMask account #N+1 by construction; these anvil vectors ARE the
+  // MetaMask address axis.
   const ANVIL =
     "test test test test test test test test test test test junk";
-  it("m/44'/60'/0'/0/0 (trading) matches anvil account #0", () => {
-    const k = deriveKey(ANVIL, "trading");
+  it("wallet 0 (m/44'/60'/0'/0/0) matches anvil/MetaMask account #0", () => {
+    const k = deriveTradingKeyForIndex(ANVIL, 0);
     expect(k.privateKey).toBe(
       "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
     );
     expect(k.address).toBe("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
   });
-  it("m/44'/60'/0'/0/1 (proof) matches anvil account #1", () => {
-    const k = deriveKey(ANVIL, "proof");
+  it("wallet 1 (m/44'/60'/0'/0/1) matches anvil/MetaMask account #1", () => {
+    const k = deriveTradingKeyForIndex(ANVIL, 1);
     expect(k.privateKey).toBe(
       "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
     );
     expect(k.address).toBe("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+  });
+  it("wallet 2 (m/44'/60'/0'/0/2) matches anvil/MetaMask account #2", () => {
+    const k = deriveTradingKeyForIndex(ANVIL, 2);
+    expect(k.privateKey).toBe(
+      "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+    );
+    expect(k.address).toBe("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
   });
 });
 
@@ -209,17 +214,17 @@ describe("per-index trading keys (wallet isolation)", () => {
     expect(tradingPathForIndex(0)).toBe("m/44'/60'/0'/0/0");
   });
 
-  it("derives distinct deterministic keys per index, none colliding with proof", () => {
+  it("derives distinct deterministic keys per index", () => {
     const keys = deriveWalletKeys(TEST_MNEMONIC, [1, 2]);
     const w0 = keys.wallets.get(0)!;
     const w1 = keys.wallets.get(1)!;
     const w2 = keys.wallets.get(2)!;
     expect(w0.privateKey).toBe(keys.trading.privateKey);
-    const all = [w0.privateKey, w1.privateKey, w2.privateKey, keys.proof.privateKey];
-    expect(new Set(all).size).toBe(4); // all distinct
+    const all = [w0.privateKey, w1.privateKey, w2.privateKey];
+    expect(new Set(all).size).toBe(3); // all distinct
     // deterministic
     expect(deriveTradingKeyForIndex(TEST_MNEMONIC, 1).privateKey).toBe(w1.privateKey);
-    expect(tradingPathForIndex(2)).toBe("m/44'/60'/2'/0/0");
+    expect(tradingPathForIndex(2)).toBe("m/44'/60'/0'/0/2");
   });
 
   it("always includes wallet 0 even when not requested", () => {

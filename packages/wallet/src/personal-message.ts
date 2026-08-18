@@ -7,7 +7,7 @@ import { addressFromUncompressedPublicKey, hex0x } from "./keys.js";
  * executor-polymarket, ethers behind executor-predictfun).
  *
  * Scope is deliberately narrow: the sidecar's account module signs the billing
- * server's SIWE challenge text VERBATIM with the in-memory proof key. This is
+ * server's SIWE challenge text VERBATIM with the in-memory account key. This is
  * NOT a signing-gateway method (the gateway signs structured orders only) and
  * is never exposed as an agent tool.
  */

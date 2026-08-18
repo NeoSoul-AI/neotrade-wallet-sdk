@@ -1,12 +1,10 @@
 export {
   generateWalletMnemonic,
   isValidMnemonic,
-  deriveKey,
   deriveWalletKeys,
   deriveTradingKeyForIndex,
   tradingPathForIndex,
   MAX_WALLET_INDEX,
-  type Role,
   type DerivedKey,
 } from "./keys.js";
 
