@@ -261,3 +261,248 @@ export async function swapNativeForErc20(
   }
   return { txHash, amountOut: decodeSwapAmountOut(receipt.logs, params.tokenOut, account.address) };
 }
+
+// ---- exactOutput: a FIXED amount received (e.g. "exactly 20 USDT") ----
+
+/** Same verified V3-periphery source as EXACT_INPUT_SINGLE above; the struct
+ * swaps the amount pair — amountOut BEFORE amountInMaximum. */
+const EXACT_OUTPUT_SINGLE = [
+  {
+    type: "function",
+    name: "exactOutputSingle",
+    stateMutability: "payable",
+    inputs: [
+      {
+        name: "params",
+        type: "tuple",
+        components: [
+          { name: "tokenIn", type: "address" },
+          { name: "tokenOut", type: "address" },
+          { name: "fee", type: "uint24" },
+          { name: "recipient", type: "address" },
+          { name: "deadline", type: "uint256" },
+          { name: "amountOut", type: "uint256" },
+          { name: "amountInMaximum", type: "uint256" },
+          { name: "sqrtPriceLimitX96", type: "uint160" },
+        ],
+      },
+    ],
+    outputs: [{ name: "amountIn", type: "uint256" }],
+  },
+] as const;
+
+const MULTICALL = [
+  {
+    type: "function",
+    name: "multicall",
+    stateMutability: "payable",
+    inputs: [{ name: "data", type: "bytes[]" }],
+    outputs: [{ name: "results", type: "bytes[]" }],
+  },
+] as const;
+
+/** refundETH() — no arguments, so the calldata IS the selector. The unit test
+ * recomputes it from the signature. */
+const REFUND_ETH_CALLDATA = "0x12210e8a" as Hex;
+
+export interface ExactOutputSingleParams {
+  tokenIn: Hex;
+  tokenOut: Hex;
+  fee: number;
+  recipient: Hex;
+  deadline: bigint;
+  amountOut: bigint;
+  amountInMaximum: bigint;
+}
+
+/** Exported for the unit test: the inner calldata, with no chain involved. */
+export function encodeExactOutputSingle(p: ExactOutputSingleParams): Hex {
+  return encodeFunctionData({
+    abi: EXACT_OUTPUT_SINGLE,
+    functionName: "exactOutputSingle",
+    args: [
+      {
+        tokenIn: p.tokenIn,
+        tokenOut: p.tokenOut,
+        fee: p.fee,
+        recipient: p.recipient,
+        deadline: p.deadline,
+        amountOut: p.amountOut,
+        amountInMaximum: p.amountInMaximum,
+        sqrtPriceLimitX96: 0n,
+      },
+    ],
+  });
+}
+
+/** The full transaction calldata for a native-input exactOutput swap:
+ * multicall([exactOutputSingle, refundETH]). The router keeps whatever part
+ * of msg.value the swap did not need; without the refundETH leg that surplus
+ * would be STRANDED in the router — the refund happens in the same
+ * transaction or not at all. */
+export function encodeExactOutMulticall(p: ExactOutputSingleParams): Hex {
+  return encodeFunctionData({
+    abi: MULTICALL,
+    functionName: "multicall",
+    args: [[encodeExactOutputSingle(p), REFUND_ETH_CALLDATA]],
+  });
+}
+
+/** maxIn math for callers: quote × (10000 + bps) / 10000, CEIL-rounded — the
+ * mirror of applySlippageBps. Ceiling is the safe direction here: the cap
+ * must fully cover the tolerance, and the unneeded surplus is refunded by
+ * the same transaction anyway. */
+export function applySlippageUpBps(amountIn: bigint, slippageBps: number): bigint {
+  if (!Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > 10_000) {
+    throw new Error(`slippageBps must be an integer in [0, 10000], got ${slippageBps}`);
+  }
+  return (amountIn * BigInt(10_000 + slippageBps) + 9_999n) / 10_000n;
+}
+
+/** WETH9's Deposit(address indexed dst, uint256 wad). The unit test
+ * recomputes this from the signature. */
+const DEPOSIT_TOPIC = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c";
+
+/** The ACTUAL native amount a swap consumed, from the receipt's wrapped-native
+ * Deposit logs (address == tokenIn, dst == router): the router wraps exactly
+ * what the pool needs and refunds the rest, so the Deposit is the spend.
+ * Exported for the unit test. Throws when a successful receipt carries no
+ * such deposit. */
+export function decodeSwapAmountIn(
+  logs: readonly { address: Hex; topics: readonly Hex[]; data: Hex }[],
+  tokenIn: Hex,
+  router: Hex,
+): bigint {
+  const wantToken = tokenIn.toLowerCase();
+  const wantDst = `0x${router.slice(2).toLowerCase().padStart(64, "0")}`;
+  let total = 0n;
+  let seen = false;
+  for (const log of logs) {
+    if (log.address.toLowerCase() !== wantToken) continue;
+    if (log.topics[0]?.toLowerCase() !== DEPOSIT_TOPIC) continue;
+    if (log.topics[1]?.toLowerCase() !== wantDst) continue;
+    seen = true;
+    total += BigInt(log.data);
+  }
+  if (!seen) {
+    throw new Error("swap succeeded but no tokenIn Deposit by the router was found in the receipt");
+  }
+  return total;
+}
+
+/** Same verified QuoterV2 as above, reverse direction. The struct's amount
+ * field is the DESIRED OUTPUT; the first return value is the required input. */
+const QUOTER_V2_EXACT_OUT = [
+  {
+    type: "function",
+    name: "quoteExactOutputSingle",
+    stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "params",
+        type: "tuple",
+        components: [
+          { name: "tokenIn", type: "address" },
+          { name: "tokenOut", type: "address" },
+          { name: "amount", type: "uint256" },
+          { name: "fee", type: "uint24" },
+          { name: "sqrtPriceLimitX96", type: "uint160" },
+        ],
+      },
+    ],
+    outputs: [
+      { name: "amountIn", type: "uint256" },
+      { name: "sqrtPriceX96After", type: "uint160" },
+      { name: "initializedTicksCrossed", type: "uint32" },
+      { name: "gasEstimate", type: "uint256" },
+    ],
+  },
+] as const;
+
+function assertAmountOut(amountOut: bigint): void {
+  if (amountOut <= 0n) {
+    throw new Error(`amountOut must be positive, got ${amountOut}`);
+  }
+}
+
+/** The reverse quote: how much native coin does a FIXED amountOut cost right
+ * now. Read-only, zero cost. */
+export async function quoteSwapNativeForErc20ExactOut(
+  e: ChainEndpoint,
+  params: { quoter: Hex; tokenIn: Hex; tokenOut: Hex; fee: number; amountOut: bigint },
+): Promise<{ amountIn: bigint }> {
+  assertFee(params.fee);
+  assertAmountOut(params.amountOut);
+  const pc = createPublicClient({ transport: http(e.rpcUrl) });
+  const { result } = await pc.simulateContract({
+    address: params.quoter,
+    abi: QUOTER_V2_EXACT_OUT,
+    functionName: "quoteExactOutputSingle",
+    args: [
+      {
+        tokenIn: params.tokenIn,
+        tokenOut: params.tokenOut,
+        amount: params.amountOut,
+        fee: params.fee,
+        sqrtPriceLimitX96: 0n,
+      },
+    ],
+  });
+  return { amountIn: result[0] };
+}
+
+/**
+ * The exactOutput swap: the recipient gets EXACTLY amountOut or the whole
+ * transaction reverts. msg.value = amountInMaximum; the surplus comes back
+ * in the same transaction via the refundETH multicall leg. Same recipient
+ * rule and error contract as swapNativeForErc20.
+ */
+export async function swapNativeForErc20ExactOut(
+  e: ChainEndpoint,
+  privateKey: Hex,
+  params: {
+    router: Hex;
+    tokenIn: Hex;
+    tokenOut: Hex;
+    fee: number;
+    amountOut: bigint;
+    amountInMaximumWei: bigint;
+    deadlineSeconds?: number;
+  },
+): Promise<{ txHash: Hex; amountIn: bigint }> {
+  assertFee(params.fee);
+  assertAmountOut(params.amountOut);
+  if (params.amountInMaximumWei <= 0n) {
+    throw new Error("amountInMaximum must be positive — it is the only slippage guard");
+  }
+  const deadlineSeconds = params.deadlineSeconds ?? 120;
+  if (!Number.isInteger(deadlineSeconds) || deadlineSeconds <= 0) {
+    throw new Error(`deadlineSeconds must be a positive integer, got ${deadlineSeconds}`);
+  }
+  const account = privateKeyToAccount(privateKey);
+  const chain = chainOf(e);
+  const wc = createWalletClient({ account, chain, transport: http(e.rpcUrl) });
+  const pc = createPublicClient({ chain, transport: http(e.rpcUrl) });
+  const data = encodeExactOutMulticall({
+    tokenIn: params.tokenIn,
+    tokenOut: params.tokenOut,
+    fee: params.fee,
+    recipient: account.address,
+    deadline: BigInt(Math.floor(Date.now() / 1000) + deadlineSeconds),
+    amountOut: params.amountOut,
+    amountInMaximum: params.amountInMaximumWei,
+  });
+  // A throw ABOVE this line means nothing was broadcast: plain error, the
+  // caller may record `failed` and safely retry.
+  const txHash = await wc.sendTransaction({ to: params.router, data, value: params.amountInMaximumWei });
+  let receipt: Awaited<ReturnType<typeof pc.waitForTransactionReceipt>>;
+  try {
+    receipt = await pc.waitForTransactionReceipt({ hash: txHash });
+  } catch (cause) {
+    throw new SwapUnconfirmedError(txHash, cause);
+  }
+  if (receipt.status !== "success") {
+    throw new SwapRevertedError(txHash);
+  }
+  return { txHash, amountIn: decodeSwapAmountIn(receipt.logs, params.tokenIn, params.router) };
+}

@@ -4,17 +4,24 @@
  * docs/specs/2026-08-18-pancake-v3-swap-design.md).
  *
  * Phases (run one at a time):
- *   quote  read-only, ZERO SPEND: QuoterV2 price for BNB→USDT across the
- *          four Pancake fee tiers, so the operator can see where the
- *          liquidity is. Proves endpoint, addresses, ABI and decoding.
- *   swap   REAL MONEY (double-gated: explicit phase arg + interactive
- *          confirm): one exactInputSingle for a small BNB amount using the
- *          key in SWAP_PRIVATE_KEY. Proves the payable auto-wrap path, the
- *          receipt decode and the minOut guard end to end.
+ *   quote      read-only, ZERO SPEND: QuoterV2 price for BNB→USDT across the
+ *              four Pancake fee tiers, so the operator can see where the
+ *              liquidity is. Proves endpoint, addresses, ABI and decoding.
+ *   quote-out  read-only, ZERO SPEND: the reverse — how much BNB a FIXED
+ *              USDT amount costs, across the four tiers.
+ *   swap       REAL MONEY (double-gated: explicit phase arg + interactive
+ *              confirm): one exactInputSingle for a small BNB amount using
+ *              the key in SWAP_PRIVATE_KEY. Proves the payable auto-wrap
+ *              path, the receipt decode and the minOut guard end to end.
+ *   swap-out   REAL MONEY (same double gate): one exactOutputSingle+refundETH
+ *              multicall — receive EXACTLY the given USDT amount, spend at
+ *              most quote×(1+slippage) BNB, surplus refunded in-tx.
  *
  * Usage:
  *   pnpm probe:swap quote [amountBnb=0.01]
+ *   pnpm probe:swap quote-out [amountUsdt=20]
  *   SWAP_PRIVATE_KEY=0x... pnpm probe:swap swap <amountBnb> [feeTier=100] [slippageBps=50]
+ *   SWAP_PRIVATE_KEY=0x... pnpm probe:swap swap-out <amountUsdt> [feeTier=100] [slippageBps=50]
  * Env:
  *   SWAP_RPC_URL      BSC endpoint (default: https://bsc-dataseed.bnbchain.org)
  *   SWAP_PRIVATE_KEY  funded key, swap phase only; never printed
@@ -27,11 +34,14 @@ import { stdin, stdout } from "node:process";
 import type { Hex } from "viem";
 import {
   applySlippageBps,
+  applySlippageUpBps,
   quoteSwapNativeForErc20,
+  quoteSwapNativeForErc20ExactOut,
   readDecimals,
   readErc20Balance,
   readNativeBalance,
   swapNativeForErc20,
+  swapNativeForErc20ExactOut,
 } from "@neotrade/x402";
 
 // Verified 2026-08-18: BscScan labels + on-chain probe (WBNB symbol()/bytecode).
@@ -43,13 +53,14 @@ const FEE_TIERS = [100, 500, 2500, 10000];
 
 const e = { rpcUrl: process.env.SWAP_RPC_URL ?? "https://bsc-dataseed.bnbchain.org", chainId: 56 };
 
-const toWei = (bnb: string): bigint => {
-  const [whole = "0", frac = ""] = bnb.split(".");
-  if (!/^\d+$/.test(whole) || (frac !== "" && !/^\d+$/.test(frac)) || frac.length > 18) {
-    throw new Error(`bad BNB amount: ${bnb}`);
+const toAtomic = (amount: string, decimals: number): bigint => {
+  const [whole = "0", frac = ""] = amount.split(".");
+  if (!/^\d+$/.test(whole) || (frac !== "" && !/^\d+$/.test(frac)) || frac.length > decimals) {
+    throw new Error(`bad amount: ${amount}`);
   }
-  return BigInt(whole) * 10n ** 18n + BigInt(frac.padEnd(18, "0") || "0");
+  return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(frac.padEnd(decimals, "0") || "0");
 };
+const toWei = (bnb: string): bigint => toAtomic(bnb, 18);
 const fmt = (atomic: bigint, decimals: number): string => {
   const base = 10n ** BigInt(decimals);
   return `${atomic / base}.${(atomic % base).toString().padStart(decimals, "0").replace(/0+$/, "") || "0"}`;
@@ -67,6 +78,58 @@ async function quotePhase(amountBnb: string): Promise<void> {
     } catch {
       console.log(`  fee ${String(fee).padStart(5)}: no quote (pool missing or empty)`);
     }
+  }
+}
+
+async function quoteOutPhase(amountUsdt: string): Promise<void> {
+  const usdtDecimals = await readDecimals(e, USDT);
+  const amountOut = toAtomic(amountUsdt, usdtDecimals);
+  console.log(`rpc: ${e.rpcUrl}`);
+  console.log(`reverse-quoting: BNB needed for exactly ${amountUsdt} USDT (read-only, zero spend)`);
+  for (const fee of FEE_TIERS) {
+    try {
+      const { amountIn } = await quoteSwapNativeForErc20ExactOut(e, { quoter: QUOTER, tokenIn: WBNB, tokenOut: USDT, fee, amountOut });
+      console.log(`  fee ${String(fee).padStart(5)} (${(fee / 10_000).toFixed(2)}%): ${fmt(amountIn, 18)} BNB`);
+    } catch {
+      console.log(`  fee ${String(fee).padStart(5)}: no quote (pool missing or empty)`);
+    }
+  }
+}
+
+async function swapOutPhase(amountUsdt: string, fee: number, slippageBps: number): Promise<void> {
+  const key = process.env.SWAP_PRIVATE_KEY as Hex | undefined;
+  if (!key) throw new Error("swap-out phase needs SWAP_PRIVATE_KEY");
+  const { privateKeyToAccount } = await import("viem/accounts");
+  const address = privateKeyToAccount(key).address;
+  const usdtDecimals = await readDecimals(e, USDT);
+  const amountOut = toAtomic(amountUsdt, usdtDecimals);
+
+  const bnbBefore = await readNativeBalance(e, address);
+  const usdtBefore = await readErc20Balance(e, USDT, address);
+  const { amountIn: quotedIn } = await quoteSwapNativeForErc20ExactOut(e, { quoter: QUOTER, tokenIn: WBNB, tokenOut: USDT, fee, amountOut });
+  const maxIn = applySlippageUpBps(quotedIn, slippageBps);
+
+  console.log(`rpc: ${e.rpcUrl}`);
+  console.log(`wallet ${address}: ${fmt(bnbBefore, 18)} BNB, ${fmt(usdtBefore, usdtDecimals)} USDT`);
+  console.log(`swap-out: receive exactly ${amountUsdt} USDT | fee tier ${fee} | quoted cost ${fmt(quotedIn, 18)} BNB | max spend ${fmt(maxIn, 18)} BNB (${slippageBps} bps), surplus refunded in-tx`);
+  const rl = createInterface({ input: stdin, output: stdout });
+  const answer = await rl.question("REAL MONEY on BSC mainnet. Proceed? (yes/N) ");
+  rl.close();
+  if (answer.trim() !== "yes") {
+    console.log("aborted, nothing sent");
+    return;
+  }
+
+  const { txHash, amountIn } = await swapNativeForErc20ExactOut(e, key, {
+    router: ROUTER, tokenIn: WBNB, tokenOut: USDT, fee, amountOut, amountInMaximumWei: maxIn,
+  });
+  console.log(`mined: https://bscscan.com/tx/${txHash}`);
+  console.log(`paid (from receipt Deposit log): ${fmt(amountIn, 18)} BNB`);
+  const bnbAfter = await readNativeBalance(e, address);
+  const usdtAfter = await readErc20Balance(e, USDT, address);
+  console.log(`re-read balances: ${fmt(bnbAfter, 18)} BNB (spent ${fmt(bnbBefore - bnbAfter, 18)} incl. gas), ${fmt(usdtAfter, usdtDecimals)} USDT (received ${fmt(usdtAfter - usdtBefore, usdtDecimals)})`);
+  if (usdtAfter - usdtBefore !== amountOut) {
+    console.log("WARNING: USDT delta is not exactly the requested amountOut — investigate before trusting the flow");
   }
 }
 
@@ -110,9 +173,14 @@ async function swapPhase(amountBnb: string, fee: number, slippageBps: number): P
 const [phase, amountArg, feeArg, slippageArg] = process.argv.slice(2);
 if (phase === "quote") {
   await quotePhase(amountArg ?? "0.01");
+} else if (phase === "quote-out") {
+  await quoteOutPhase(amountArg ?? "20");
 } else if (phase === "swap") {
   if (!amountArg) throw new Error("usage: pnpm probe:swap swap <amountBnb> [feeTier=100] [slippageBps=50]");
   await swapPhase(amountArg, feeArg ? Number(feeArg) : 100, slippageArg ? Number(slippageArg) : 50);
+} else if (phase === "swap-out") {
+  if (!amountArg) throw new Error("usage: pnpm probe:swap swap-out <amountUsdt> [feeTier=100] [slippageBps=50]");
+  await swapOutPhase(amountArg, feeArg ? Number(feeArg) : 100, slippageArg ? Number(slippageArg) : 50);
 } else {
-  throw new Error("usage: pnpm probe:swap <quote|swap> ...");
+  throw new Error("usage: pnpm probe:swap <quote|quote-out|swap|swap-out> ...");
 }

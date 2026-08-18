@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
-import type { Hex } from "viem";
+import { decodeFunctionData, toEventSelector, toFunctionSelector, type Hex } from "viem";
 import {
   applySlippageBps,
+  applySlippageUpBps,
+  decodeSwapAmountIn,
   decodeSwapAmountOut,
   encodeExactInputSingle,
+  encodeExactOutMulticall,
+  encodeExactOutputSingle,
   quoteSwapNativeForErc20,
+  quoteSwapNativeForErc20ExactOut,
   swapNativeForErc20,
+  swapNativeForErc20ExactOut,
 } from "../src/swap.js";
 
 const TOKEN_OUT = "0x55d398326f99059fF775485246999027B3197955" as const;
@@ -143,5 +149,140 @@ describe("parameter validation happens before any network call", () => {
     await expect(
       swapNativeForErc20(DEAD_ENDPOINT, DUMMY_KEY, { ...base, deadlineSeconds: 0 }),
     ).rejects.toThrow(/deadlineSeconds/);
+  });
+});
+
+// ---- exactOutput (fixed amount received, e.g. "exactly 20 USDT") ----
+
+const OUT_PARAMS = {
+  tokenIn: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" as Hex,
+  tokenOut: TOKEN_OUT as Hex,
+  fee: 100,
+  recipient: RECIPIENT as Hex,
+  deadline: 1_800_000_000n,
+  amountOut: 20n * 10n ** 18n,
+  amountInMaximum: 34n * 10n ** 15n,
+};
+
+describe("encodeExactOutputSingle", () => {
+  it("encodes exactOutputSingle(struct) — selector and 8-word layout", () => {
+    const data = encodeExactOutputSingle(OUT_PARAMS);
+    // Selector computed from the verified signature, not remembered.
+    expect(data.slice(0, 10)).toBe(
+      toFunctionSelector("exactOutputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))"),
+    );
+    expect(data).toHaveLength(2 + 8 + 64 * 8);
+  });
+
+  it("places amountOut BEFORE amountInMaximum, sqrtPriceLimitX96 last and zero", () => {
+    const data = encodeExactOutputSingle(OUT_PARAMS);
+    const word = (i: number) => data.slice(10 + i * 64, 10 + (i + 1) * 64);
+    expect(BigInt(`0x${word(2)}`)).toBe(100n);                 // fee
+    expect(BigInt(`0x${word(5)}`)).toBe(20n * 10n ** 18n);     // amountOut
+    expect(BigInt(`0x${word(6)}`)).toBe(34n * 10n ** 15n);     // amountInMaximum
+    expect(BigInt(`0x${word(7)}`)).toBe(0n);                   // sqrtPriceLimitX96
+  });
+});
+
+describe("encodeExactOutMulticall", () => {
+  it("wraps [exactOutputSingle, refundETH] in multicall(bytes[])", () => {
+    const data = encodeExactOutMulticall(OUT_PARAMS);
+    expect(data.slice(0, 10)).toBe(toFunctionSelector("multicall(bytes[])"));
+    const MULTICALL_ABI = [
+      {
+        type: "function",
+        name: "multicall",
+        stateMutability: "payable",
+        inputs: [{ name: "data", type: "bytes[]" }],
+        outputs: [{ name: "results", type: "bytes[]" }],
+      },
+    ] as const;
+    const { args } = decodeFunctionData({ abi: MULTICALL_ABI, data });
+    expect(args[0]).toEqual([encodeExactOutputSingle(OUT_PARAMS), toFunctionSelector("refundETH()")]);
+  });
+});
+
+describe("applySlippageUpBps", () => {
+  it("0 bps returns the amount unchanged", () => {
+    expect(applySlippageUpBps(999n, 0)).toBe(999n);
+  });
+
+  it("ceils, never floors — the max must cover the tolerance fully", () => {
+    // 999 × 10050 / 10000 = 1003.995 → 1004
+    expect(applySlippageUpBps(999n, 50)).toBe(1004n);
+  });
+
+  it("10000 bps doubles the amount", () => {
+    expect(applySlippageUpBps(999n, 10_000)).toBe(1998n);
+  });
+
+  it("rejects out-of-range and non-integer bps", () => {
+    expect(() => applySlippageUpBps(1n, -1)).toThrow(/slippageBps/);
+    expect(() => applySlippageUpBps(1n, 10_001)).toThrow(/slippageBps/);
+    expect(() => applySlippageUpBps(1n, 0.5)).toThrow(/slippageBps/);
+  });
+});
+
+describe("decodeSwapAmountIn", () => {
+  // Topic computed from the verified WETH9 event signature, not remembered.
+  const DEPOSIT_TOPIC = toEventSelector("Deposit(address,uint256)");
+  const depositLog = (token: string, dst: string, wad: bigint) => ({
+    address: token as Hex,
+    topics: [DEPOSIT_TOPIC, pad32(dst)],
+    data: `0x${wad.toString(16).padStart(64, "0")}` as Hex,
+  });
+
+  it("finds the router's tokenIn Deposit among noise", () => {
+    const logs = [
+      depositLog("0x0000000000000000000000000000000000000001", ROUTER, 7n), // wrong token
+      depositLog(TOKEN_IN, "0x0000000000000000000000000000000000000002", 9n), // wrong depositor
+      transferLog(TOKEN_IN, ROUTER, 11n), // wrong event
+      depositLog(TOKEN_IN, ROUTER, 42n),
+    ];
+    expect(decodeSwapAmountIn(logs, TOKEN_IN, ROUTER)).toBe(42n);
+  });
+
+  it("matches addresses case-insensitively and sums multiple deposits", () => {
+    const logs = [
+      depositLog(TOKEN_IN.toLowerCase(), ROUTER.toLowerCase(), 40n),
+      depositLog(TOKEN_IN, ROUTER, 2n),
+    ];
+    expect(decodeSwapAmountIn(logs, TOKEN_IN, ROUTER)).toBe(42n);
+  });
+
+  it("throws when the receipt holds no matching deposit", () => {
+    expect(() => decodeSwapAmountIn([], TOKEN_IN, ROUTER)).toThrow(/no tokenIn Deposit/);
+  });
+});
+
+describe("exactOut parameter validation happens before any network call", () => {
+  const base = {
+    router: ROUTER,
+    tokenIn: TOKEN_IN,
+    tokenOut: TOKEN_OUT as Hex,
+    fee: 100,
+    amountOut: 20n * 10n ** 18n,
+    amountInMaximumWei: 34n * 10n ** 15n,
+  };
+
+  it("quote rejects a non-positive amountOut", async () => {
+    await expect(
+      quoteSwapNativeForErc20ExactOut(DEAD_ENDPOINT, { quoter: QUOTER, tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT as Hex, fee: 100, amountOut: 0n }),
+    ).rejects.toThrow(/amountOut/);
+  });
+
+  it("swap rejects a non-positive amountOut and amountInMaximum", async () => {
+    await expect(
+      swapNativeForErc20ExactOut(DEAD_ENDPOINT, DUMMY_KEY, { ...base, amountOut: 0n }),
+    ).rejects.toThrow(/amountOut/);
+    await expect(
+      swapNativeForErc20ExactOut(DEAD_ENDPOINT, DUMMY_KEY, { ...base, amountInMaximumWei: 0n }),
+    ).rejects.toThrow(/amountInMaximum/);
+  });
+
+  it("swap rejects an out-of-range fee", async () => {
+    await expect(
+      swapNativeForErc20ExactOut(DEAD_ENDPOINT, DUMMY_KEY, { ...base, fee: 0 }),
+    ).rejects.toThrow(/fee/);
   });
 });
