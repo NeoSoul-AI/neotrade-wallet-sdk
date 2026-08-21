@@ -116,6 +116,49 @@ export interface AuditEntry {
   reason?: string;
 }
 
+export interface OrderLedgerEntry {
+  signature: string;
+  orderHash: string;
+}
+
+/**
+ * The exactly-once ledger. The in-memory default is correct but unbounded and
+ * process-local; a host that runs long enough to care about either injects its
+ * own store (write-through persistence, or a bound chosen with knowledge of
+ * its retry horizon). The gateway itself never evicts: dropping an entry
+ * silently re-opens that clientOrderId for a second signature, so any
+ * eviction policy belongs to the host.
+ *
+ * `insertIfAbsent` is the exactly-once primitive and MUST be atomic in the
+ * store's own domain: when two writers race for one key, exactly one insert
+ * wins and every loser is handed the winning entry. A get-then-set pair
+ * cannot provide this across processes sharing a persistent backend, which is
+ * why the interface does not expose a bare `set`. `get` is a read-only
+ * lookup; it may be served from a stale snapshot — correctness rests on the
+ * insert alone.
+ */
+export interface OrderLedgerStore {
+  get(key: string): OrderLedgerEntry | undefined;
+  insertIfAbsent(key: string, entry: OrderLedgerEntry): OrderLedgerEntry | undefined;
+}
+
+class InMemoryOrderLedger implements OrderLedgerStore {
+  private readonly entries = new Map<string, OrderLedgerEntry>();
+
+  get(key: string): OrderLedgerEntry | undefined {
+    return this.entries.get(key);
+  }
+
+  insertIfAbsent(key: string, entry: OrderLedgerEntry): OrderLedgerEntry | undefined {
+    const existing = this.entries.get(key);
+    if (existing) {
+      return existing;
+    }
+    this.entries.set(key, entry);
+    return undefined;
+  }
+}
+
 export interface SigningGatewayOptions {
   signer: OrderSigner;
   now?: () => number;
@@ -125,6 +168,12 @@ export interface SigningGatewayOptions {
   defaultSessionTtlMs?: number;
   maxSessionTtlMs?: number;
   minSessionTtlMs?: number;
+  /** Audit-log retention: the newest `auditLimit` entries are kept, oldest
+   * evicted first (default 10_000). The gateway lives for the whole host
+   * process, so an unbounded log is an OOM waiting on request volume. */
+  auditLimit?: number;
+  /** Exactly-once ledger store; defaults to a process-local Map. */
+  ledger?: OrderLedgerStore;
 }
 
 export class SigningGateway {
@@ -134,8 +183,9 @@ export class SigningGateway {
   private readonly maxSessionTtlMs: number;
   private readonly minSessionTtlMs: number;
   private readonly authorizations = new Map<string, AgentSigningAuthorization>();
-  private readonly signedOrders = new Map<string, { signature: string; orderHash: string }>();
+  private readonly signedOrders: OrderLedgerStore;
   private readonly audit: AuditEntry[] = [];
+  private readonly auditLimit: number;
   private sessionExpiresAt = 0;
 
   constructor(options: SigningGatewayOptions) {
@@ -144,6 +194,15 @@ export class SigningGateway {
     this.defaultSessionTtlMs = options.defaultSessionTtlMs ?? 60 * 60 * 1000;
     this.minSessionTtlMs = options.minSessionTtlMs ?? 60 * 1000;
     this.maxSessionTtlMs = options.maxSessionTtlMs ?? 24 * 60 * 60 * 1000;
+    const auditLimit = options.auditLimit ?? 10_000;
+    if (!Number.isInteger(auditLimit) || auditLimit < 1) {
+      // NaN and Infinity make the eviction comparison silently false forever,
+      // un-bounding the log — the exact OOM this option exists to prevent.
+      // Bad config is a construction-time rejection, not a fallback.
+      throw new Error(`auditLimit must be a positive integer, got ${auditLimit}`);
+    }
+    this.auditLimit = auditLimit;
+    this.signedOrders = options.ledger ?? new InMemoryOrderLedger();
   }
 
   /** Opens a signing session (key unlocked by the user). A finite `ttlMs` is
@@ -215,50 +274,46 @@ export class SigningGateway {
     }
     const order = parsed.data;
 
-    const authorization = this.authorizations.get(order.agentId);
-    if (!authorization) {
-      return this.reject(order, "unauthorized_agent", `agent ${order.agentId} has no signing authorization`);
-    }
-    if (authorization.expiresAt !== undefined && this.now() >= authorization.expiresAt) {
-      return this.reject(order, "authorization_expired", `authorization for ${order.agentId} expired`);
-    }
-    if (authorization.allowedMarkets && !authorization.allowedMarkets.includes(order.market)) {
-      return this.reject(order, "market_not_allowed", `market ${order.market} not in allowlist`);
+    const rejection = this.policyRejection(order);
+    if (rejection) {
+      return this.reject(order, rejection.code, rejection.reason);
     }
     // NO SIZE CHECK HERE, BY DESIGN (see OrderIntentSchema's sizing note). The
     // per-order USD cap this gate used to enforce now has exactly one owner:
     // the host's order executor, which resolves sizing with the context this
     // gate lacks (side, bankroll, venue minimum, live book).
 
-    const idempotencyKey = `${order.agentId} ${order.clientOrderId}`;
+    // JSON-encoded tuple, not a delimiter join: agentId and clientOrderId are
+    // free-form strings, so any in-band separator can be forged by field
+    // content — ("alice", "bob sell-1") and ("alice bob", "sell-1") must never
+    // share a slot.
+    const idempotencyKey = JSON.stringify([order.agentId, order.clientOrderId]);
     const orderHash = hashOrder(order);
     const existing = this.signedOrders.get(idempotencyKey);
     if (existing) {
-      if (existing.orderHash !== orderHash) {
-        return this.reject(
-          order,
-          "idempotency_conflict",
-          `clientOrderId ${order.clientOrderId} was already used for a different order`,
-        );
-      }
-      this.audit.push({
-        at: this.now(),
-        decision: "replayed",
-        agentId: order.agentId,
-        clientOrderId: order.clientOrderId,
-      });
-      return {
-        ok: true,
-        signature: existing.signature,
-        signerAddress: this.signer.address,
-        clientOrderId: order.clientOrderId,
-        replay: true,
-      };
+      return this.settleAgainstLedger(order, existing, orderHash);
     }
 
     const { signature } = await this.signer.signOrder(order);
-    this.signedOrders.set(idempotencyKey, { signature, orderHash });
-    this.audit.push({
+
+    // Everything checked before the await is stale now: lock(), revokeAgent(),
+    // a tightened allowlist or a lapsed expiry during the signer call must all
+    // still stop this order. Fail-closed means the LIVE policy decides what
+    // gets recorded and returned, not a snapshot from before the suspension.
+    const postRejection = this.policyRejection(order);
+    if (postRejection) {
+      return this.reject(order, postRejection.code, postRejection.reason);
+    }
+    // Same staleness, ledger side: the slot is taken by ONE atomic insert.
+    // Whoever raced through it first — an identical order past the await in
+    // this process, or another process on a shared store — owns the slot, and
+    // its stamp is the answer; a second signature is never recorded.
+    const raced = this.signedOrders.insertIfAbsent(idempotencyKey, { signature, orderHash });
+    if (raced) {
+      return this.settleAgainstLedger(order, raced, orderHash);
+    }
+
+    this.record({
       at: this.now(),
       decision: "signed",
       agentId: order.agentId,
@@ -273,12 +328,74 @@ export class SigningGateway {
     };
   }
 
+  /** The session/agent/market predicates, evaluated against live state. Runs
+   * once before the signer call and again after it resolves (GAT-4): the
+   * await is a mutation window, and a stamp must never outrun a lock() or
+   * revocation that landed inside it. */
+  private policyRejection(
+    order: OrderIntent,
+  ): { code: SignRejectionCode; reason: string } | undefined {
+    if (!this.unlocked) {
+      return { code: "locked", reason: "signing session locked or expired" };
+    }
+    const authorization = this.authorizations.get(order.agentId);
+    if (!authorization) {
+      return {
+        code: "unauthorized_agent",
+        reason: `agent ${order.agentId} has no signing authorization`,
+      };
+    }
+    if (authorization.expiresAt !== undefined && this.now() >= authorization.expiresAt) {
+      return { code: "authorization_expired", reason: `authorization for ${order.agentId} expired` };
+    }
+    if (authorization.allowedMarkets && !authorization.allowedMarkets.includes(order.market)) {
+      return { code: "market_not_allowed", reason: `market ${order.market} not in allowlist` };
+    }
+    return undefined;
+  }
+
+  /** An occupied ledger slot settles a request as either a replay (same
+   * content — return the original stamp) or a conflict (different content). */
+  private settleAgainstLedger(
+    order: OrderIntent,
+    existing: OrderLedgerEntry,
+    orderHash: string,
+  ): SignOrderResult {
+    if (existing.orderHash !== orderHash) {
+      return this.reject(
+        order,
+        "idempotency_conflict",
+        `clientOrderId ${order.clientOrderId} was already used for a different order`,
+      );
+    }
+    this.record({
+      at: this.now(),
+      decision: "replayed",
+      agentId: order.agentId,
+      clientOrderId: order.clientOrderId,
+    });
+    return {
+      ok: true,
+      signature: existing.signature,
+      signerAddress: this.signer.address,
+      clientOrderId: order.clientOrderId,
+      replay: true,
+    };
+  }
+
+  private record(entry: AuditEntry): void {
+    if (this.audit.length >= this.auditLimit) {
+      this.audit.splice(0, this.audit.length - this.auditLimit + 1);
+    }
+    this.audit.push(entry);
+  }
+
   private reject(
     order: OrderIntent | undefined,
     code: SignRejectionCode,
     reason: string,
   ): SignOrderResult {
-    this.audit.push({
+    this.record({
       at: this.now(),
       decision: "rejected",
       agentId: order?.agentId,

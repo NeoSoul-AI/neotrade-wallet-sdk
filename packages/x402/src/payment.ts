@@ -38,10 +38,11 @@ export async function signPayment(
   if (quote.asset === "" || quote.payTo === "") {
     throw new Error("x402: quote is missing asset or payTo");
   }
-  if (!/^[0-9]+$/.test(quote.maxAmountRequired) || quote.maxAmountRequired === "0") {
+  if (!/^[0-9]+$/.test(quote.maxAmountRequired) || BigInt(quote.maxAmountRequired) <= 0n) {
     // Fail before signing rather than after: an amount the SDK cannot turn into
-    // a positive BigInt produces either a throw deep inside viem or, for "0", a
-    // perfectly valid signature authorising nothing.
+    // a positive BigInt produces either a throw deep inside viem or, for zero, a
+    // perfectly valid signature authorising nothing. Zero is judged on the
+    // parsed VALUE, not the literal "0" — "00" spells zero too.
     throw new Error(`x402: maxAmountRequired ${quote.maxAmountRequired} is not a positive integer string`);
   }
 
