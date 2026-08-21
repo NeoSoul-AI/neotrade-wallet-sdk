@@ -7,6 +7,8 @@ export {
   type SignOrderResult,
   type SignRejectionCode,
   type AuditEntry,
+  type OrderLedgerEntry,
+  type OrderLedgerStore,
   type SigningGatewayOptions,
 } from "./gateway.js";
 

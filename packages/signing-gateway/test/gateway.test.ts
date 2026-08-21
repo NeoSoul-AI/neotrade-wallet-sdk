@@ -278,4 +278,220 @@ describe("SigningGateway", () => {
       ["rejected", "invalid_request"],
     ]);
   });
+
+  it("never lets distinct (agentId, clientOrderId) pairs share an idempotency slot (GAT-3)", async () => {
+    // A space-joined key maps ("alice", "bob sell-1") and ("alice bob", "sell-1")
+    // to the same slot, so the second agent's FIRST order — potentially a
+    // position-closing SELL — is permanently rejected as a conflict.
+    const gateway = makeGateway();
+    gateway.authorizeAgent({ agentId: "alice" });
+    gateway.authorizeAgent({ agentId: "alice bob" });
+    expect(
+      await gateway.signOrder(order({ agentId: "alice", clientOrderId: "bob sell-1" })),
+    ).toMatchObject({ ok: true, replay: false });
+    expect(
+      await gateway.signOrder(order({ agentId: "alice bob", clientOrderId: "sell-1" })),
+    ).toMatchObject({ ok: true, replay: false });
+  });
+});
+
+/** A minimal in-memory OrderLedgerStore, the shape a persisting host would
+ * wrap around its own storage. `lieOnGet` simulates a store whose reads are
+ * stale (another process wrote between our read and our insert) — the case
+ * the atomic insert exists for. */
+function memoryLedger(options: { lieOnGet?: boolean } = {}) {
+  const entries = new Map<string, { signature: string; orderHash: string }>();
+  return {
+    entries,
+    get: (key: string) => (options.lieOnGet ? undefined : entries.get(key)),
+    insertIfAbsent(key: string, entry: { signature: string; orderHash: string }) {
+      const existing = entries.get(key);
+      if (existing) return existing;
+      entries.set(key, entry);
+      return undefined;
+    },
+  };
+}
+
+describe("SigningGateway bounded memory (GAT-2)", () => {
+  it("rejects an auditLimit that is not a positive integer, rather than silently unbounding", () => {
+    // NaN makes `length >= limit` compare false forever, so the OOM guard
+    // would be silently gone. Bad config must be a construction-time
+    // rejection, fail-closed.
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1.5]) {
+      expect(
+        () => new SigningGateway({ signer: new PolicyStampSigner(), auditLimit: bad }),
+      ).toThrow(/auditLimit/);
+    }
+  });
+
+  it("bounds the audit log at auditLimit, dropping the oldest entries", async () => {
+    clock = 1_000_000;
+    const gateway = new SigningGateway({
+      signer: new PolicyStampSigner(),
+      now: () => clock,
+      auditLimit: 2,
+    });
+    gateway.unlock({ ttlMs: 60 * 60 * 1000 });
+    gateway.authorizeAgent({ agentId: "a1" });
+    await gateway.signOrder(order({ clientOrderId: "c-1" }));
+    await gateway.signOrder(order({ clientOrderId: "c-2" }));
+    await gateway.signOrder(order({ clientOrderId: "c-3" }));
+    expect(gateway.auditLog().map((entry) => entry.clientOrderId)).toEqual(["c-2", "c-3"]);
+  });
+
+  it("defaults the audit bound to 10_000 entries", async () => {
+    const gateway = makeGateway();
+    for (let i = 0; i < 10_050; i++) {
+      await gateway.signOrder({ garbage: i });
+    }
+    expect(gateway.auditLog()).toHaveLength(10_000);
+  });
+
+  it("accepts an injected order ledger store, so the host can bound or persist it", async () => {
+    clock = 1_000_000;
+    const ledger = memoryLedger();
+    const gateway = new SigningGateway({
+      signer: new PolicyStampSigner(),
+      now: () => clock,
+      ledger,
+    });
+    gateway.unlock({ ttlMs: 60 * 60 * 1000 });
+    gateway.authorizeAgent({ agentId: "a1" });
+    const first = await gateway.signOrder(order());
+    if (!first.ok) throw new Error("unreachable");
+    expect(ledger.entries.size).toBe(1);
+
+    // A second gateway sharing the store honours the existing entry: the
+    // exactly-once guarantee survives a process restart when the host persists.
+    const restarted = new SigningGateway({
+      signer: new PolicyStampSigner(),
+      now: () => clock,
+      ledger,
+    });
+    restarted.unlock({ ttlMs: 60 * 60 * 1000 });
+    restarted.authorizeAgent({ agentId: "a1" });
+    const replayed = await restarted.signOrder(order());
+    expect(replayed).toMatchObject({ ok: true, replay: true, signature: first.signature });
+  });
+
+  it("occupies the ledger slot through a single atomic insert, honouring a racing winner", async () => {
+    // A shared persistent store gives no read-your-writes guarantee across
+    // processes: `get` can miss an entry another process is committing. The
+    // slot must therefore be taken by ONE atomic insert-if-absent, and when
+    // that insert reports an occupant, the occupant's stamp is the answer —
+    // never a second signature for the same clientOrderId.
+    clock = 1_000_000;
+    let calls = 0;
+    const signer = {
+      address: "0xDEV0000000000000000000000000000000000000",
+      async signOrder() {
+        calls += 1;
+        return { signature: `devsig:unique-${calls}` };
+      },
+    };
+    const gateway = new SigningGateway({
+      signer,
+      now: () => clock,
+      ledger: memoryLedger({ lieOnGet: true }),
+    });
+    gateway.unlock({ ttlMs: 60 * 60 * 1000 });
+    gateway.authorizeAgent({ agentId: "a1" });
+
+    const first = await gateway.signOrder(order());
+    if (!first.ok) throw new Error("unreachable");
+    // Every pre-insert read said "empty"; only the atomic insert can know the
+    // slot was already taken.
+    const second = await gateway.signOrder(order());
+    expect(second).toMatchObject({ ok: true, replay: true, signature: first.signature });
+  });
+});
+
+describe("SigningGateway policy re-check after the signer await (GAT-4)", () => {
+  /** A signer whose resolution the test controls, to hold an order in flight
+   * across a policy mutation. */
+  function deferredSigner(): {
+    signer: { address: string; signOrder(): Promise<{ signature: string }> };
+    release: () => void;
+  } {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let calls = 0;
+    return {
+      signer: {
+        address: "0xDEV0000000000000000000000000000000000000",
+        async signOrder() {
+          await gate;
+          calls += 1;
+          return { signature: `devsig:deferred-${calls}` };
+        },
+      },
+      release,
+    };
+  }
+
+  function makeDeferredGateway(): { gateway: SigningGateway; release: () => void } {
+    clock = 1_000_000;
+    const { signer, release } = deferredSigner();
+    const gateway = new SigningGateway({ signer, now: () => clock });
+    gateway.unlock({ ttlMs: 60 * 60 * 1000 });
+    gateway.authorizeAgent({ agentId: "a1" });
+    return { gateway, release };
+  }
+
+  it("rejects an in-flight order when the session is locked during the await, recording nothing", async () => {
+    const { gateway, release } = makeDeferredGateway();
+    const pending = gateway.signOrder(order());
+    gateway.lock();
+    release();
+    expect(await pending).toMatchObject({ ok: false, code: "locked" });
+    expect(gateway.auditLog().at(-1)).toMatchObject({ decision: "rejected", code: "locked" });
+
+    // The ledger must not hold the aborted order: after re-unlock the same
+    // clientOrderId signs fresh rather than replaying a stamp that was never issued.
+    gateway.unlock({ ttlMs: 60 * 60 * 1000 });
+    expect(await gateway.signOrder(order())).toMatchObject({ ok: true, replay: false });
+  });
+
+  it("rejects an in-flight order when the agent is revoked during the await", async () => {
+    const { gateway, release } = makeDeferredGateway();
+    const pending = gateway.signOrder(order());
+    gateway.revokeAgent("a1");
+    release();
+    expect(await pending).toMatchObject({ ok: false, code: "unauthorized_agent" });
+  });
+
+  it("rejects an in-flight order when the authorization expires during the await", async () => {
+    const { gateway, release } = makeDeferredGateway();
+    gateway.authorizeAgent({ agentId: "a1", expiresAt: clock + 1_000 });
+    const pending = gateway.signOrder(order());
+    clock += 1_000;
+    release();
+    expect(await pending).toMatchObject({ ok: false, code: "authorization_expired" });
+  });
+
+  it("rejects an in-flight order when the market allowlist is tightened during the await", async () => {
+    const { gateway, release } = makeDeferredGateway();
+    const pending = gateway.signOrder(order({ market: "market-x" }));
+    gateway.authorizeAgent({ agentId: "a1", allowedMarkets: ["market-y"] });
+    release();
+    expect(await pending).toMatchObject({ ok: false, code: "market_not_allowed" });
+  });
+
+  it("issues exactly one signature when identical orders race through the await", async () => {
+    // Same TOCTOU window, ledger side: two identical in-flight orders must not
+    // both record and return distinct stamps.
+    const { gateway, release } = makeDeferredGateway();
+    const p1 = gateway.signOrder(order());
+    const p2 = gateway.signOrder(order());
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    if (!r1.ok || !r2.ok) throw new Error("unreachable");
+    expect(r2.signature).toBe(r1.signature);
+    expect([r1.replay, r2.replay].sort()).toEqual([false, true]);
+    expect(gateway.auditLog().map((entry) => entry.decision).sort()).toEqual([
+      "replayed",
+      "signed",
+    ]);
+  });
 });

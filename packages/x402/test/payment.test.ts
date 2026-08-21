@@ -98,4 +98,11 @@ describe("signPayment", () => {
     await expect(signPayment({ ...QUOTE, maxAmountRequired: "5.0" }, PRIV)).rejects.toThrow(/positive/);
     await expect(signPayment({ ...QUOTE, maxAmountRequired: "" }, PRIV)).rejects.toThrow(/positive/);
   });
+
+  it("refuses leading-zero encodings of zero (PAY-1)", async () => {
+    // "00" and "000" match the digit regex and are not the literal "0", yet
+    // BigInt("00") is 0n — the zero guard must hold for every spelling of zero.
+    await expect(signPayment({ ...QUOTE, maxAmountRequired: "00" }, PRIV)).rejects.toThrow(/positive/);
+    await expect(signPayment({ ...QUOTE, maxAmountRequired: "000" }, PRIV)).rejects.toThrow(/positive/);
+  });
 });
