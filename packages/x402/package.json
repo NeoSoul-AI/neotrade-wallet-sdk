@@ -1,6 +1,6 @@
 {
   "name": "@neotrade/x402",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "x402 / Permit2 payment client for buying house-account credit — the ONLY package outside executor-polymarket allowed to import viem, and the only one allowed to import @x402/*",
   "license": "MIT",
   "type": "module",

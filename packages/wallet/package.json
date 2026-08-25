@@ -1,6 +1,6 @@
 {
   "name": "@neotrade/wallet",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Local trading-key wallet: BIP-39 generation with derivation-path key separation, mnemonic backup verification, and encrypted keystore",
   "license": "MIT",
   "type": "module",

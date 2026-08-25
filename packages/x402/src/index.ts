@@ -1,5 +1,6 @@
 export type { ChainEndpoint, PaymentQuote, SignedPayment } from "./types.js";
 export { signPayment } from "./payment.js";
+export type { TypedDataSigner } from "./signer.js";
 export {
   approvePermit2,
   readDecimals,
