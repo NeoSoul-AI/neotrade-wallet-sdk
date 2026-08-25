@@ -1,6 +1,6 @@
 {
   "name": "@neotrade/signing-gateway",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Order signing policy gate: structured orders only (no raw-hash API exists), per-agent limits fail-closed, time-limited sessions, idempotent authorization, append-only decision log — the cryptographic venue signature is produced downstream by the venue executor",
   "license": "MIT",
   "type": "module",
