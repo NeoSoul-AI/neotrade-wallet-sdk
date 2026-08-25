@@ -99,6 +99,55 @@ describe("signPayment", () => {
     await expect(signPayment({ ...QUOTE, maxAmountRequired: "" }, PRIV)).rejects.toThrow(/positive/);
   });
 
+  // The widened second parameter: a browser has no private key, only an
+  // injected wallet exposing `{address, signTypedData}` — which is the entire
+  // ClientEvmSigner surface the permit2 path touches. The recording signer
+  // proves the pass-through: what it returns IS the payload's signature, its
+  // address IS the payer, and what it is asked to sign is the Permit2 witness
+  // transfer — not an EIP-3009 authorization.
+  it("accepts an injected {address, signTypedData} signer and passes it through", async () => {
+    const asked: Array<{ domain: Record<string, unknown>; primaryType: string }> = [];
+    const signer = {
+      address: "0xa16706b18366b7f9fedff4c9a154745481af4023" as const,
+      signTypedData: async (message: { domain: Record<string, unknown>; primaryType: string }) => {
+        asked.push({ domain: message.domain, primaryType: message.primaryType });
+        return "0xdeadbeef" as const;
+      },
+    };
+    const signed = await signPayment(QUOTE, signer);
+    expect(signed.payload["signature"]).toBe("0xdeadbeef");
+    const auth = signed.payload["permit2Authorization"] as { from: string };
+    expect(auth.from.toLowerCase()).toBe(signer.address);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]?.primaryType).toBe("PermitWitnessTransferFrom");
+    expect(asked[0]?.domain["name"]).toBe("Permit2");
+  });
+
+  it("signs the same structure through an injected signer as through the key", async () => {
+    // Same key both ways: once as the raw hex, once wrapped the way a browser
+    // wallet would wrap itself. Nonce and deadline differ by construction, so
+    // the pin is on everything that must not differ.
+    const { privateKeyToAccount } = await import("viem/accounts");
+    const account = privateKeyToAccount(PRIV);
+    const viaKey = await signPayment(QUOTE, PRIV);
+    const viaSigner = await signPayment(QUOTE, {
+      address: account.address,
+      signTypedData: (message) =>
+        account.signTypedData(message as Parameters<typeof account.signTypedData>[0]),
+    });
+    const authOf = (p: Record<string, unknown>) =>
+      p["permit2Authorization"] as {
+        from: string;
+        spender: string;
+        permitted: { token: string; amount: string };
+        witness: { to: string; validAfter: string };
+      };
+    expect(authOf(viaSigner.payload).from).toBe(authOf(viaKey.payload).from);
+    expect(authOf(viaSigner.payload).spender).toBe(authOf(viaKey.payload).spender);
+    expect(authOf(viaSigner.payload).permitted).toEqual(authOf(viaKey.payload).permitted);
+    expect(authOf(viaSigner.payload).witness).toEqual(authOf(viaKey.payload).witness);
+  });
+
   it("refuses leading-zero encodings of zero (PAY-1)", async () => {
     // "00" and "000" match the digit regex and are not the literal "0", yet
     // BigInt("00") is 0n — the zero guard must hold for every spelling of zero.

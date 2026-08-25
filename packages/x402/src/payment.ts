@@ -1,5 +1,5 @@
 import { ExactEvmScheme } from "@x402/evm/exact/client";
-import { toSigner } from "./signer.js";
+import { toSigner, type TypedDataSigner } from "./signer.js";
 import type { PaymentQuote, SignedPayment } from "./types.js";
 
 /**
@@ -24,10 +24,15 @@ import type { PaymentQuote, SignedPayment } from "./types.js";
  *
  * All of the above was read out of @x402/evm@2.21.0's own compiled source
  * (`chunk-3QTA5JH4.mjs`, `chunk-JFVEMVMS.mjs`), not from its docs.
+ *
+ * THE SIGNER IS A UNION: a daemon holding key material passes the private key;
+ * a browser passes the injected wallet as `{address, signTypedData}` — signing
+ * is pure EIP-712, so that pair is the whole requirement. Existing callers are
+ * byte-identical.
  */
 export async function signPayment(
   quote: PaymentQuote,
-  privateKey: `0x${string}`,
+  keyOrSigner: `0x${string}` | TypedDataSigner,
 ): Promise<SignedPayment> {
   const method = quote.extra?.["assetTransferMethod"];
   if (method !== "permit2") {
@@ -46,7 +51,7 @@ export async function signPayment(
     throw new Error(`x402: maxAmountRequired ${quote.maxAmountRequired} is not a positive integer string`);
   }
 
-  const scheme = new ExactEvmScheme(toSigner(privateKey));
+  const scheme = new ExactEvmScheme(toSigner(keyOrSigner));
   const result = await scheme.createPaymentPayload(1, {
     scheme: quote.scheme,
     network: quote.network as `${string}:${string}`,
