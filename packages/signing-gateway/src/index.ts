@@ -1,7 +1,11 @@
 export {
   SigningGateway,
   OrderIntentSchema,
+  PredictionOrderIntentSchema,
+  SpotOrderIntentSchema,
   type OrderIntent,
+  type PredictionOrderIntent,
+  type SpotOrderIntent,
   type AgentSigningAuthorization,
   type OrderSigner,
   type SignOrderResult,

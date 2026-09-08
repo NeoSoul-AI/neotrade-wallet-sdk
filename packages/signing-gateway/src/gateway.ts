@@ -46,7 +46,7 @@ import { z } from "zod";
  * host — so the cap belongs there too, next to the bankroll, the venue minimum
  * and the live book it has to be reconciled against.
  */
-export const OrderIntentSchema = z.discriminatedUnion("side", [
+export const PredictionOrderIntentSchema = z.discriminatedUnion("side", [
   z
     .object({
       agentId: z.string().min(1),
@@ -80,6 +80,49 @@ export const OrderIntentSchema = z.discriminatedUnion("side", [
     .strict(),
 ]);
 
+const evmAddress = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "expected a 0x-prefixed 20-byte hex address");
+/** Base-10 integer in the asset's smallest unit — never a decimal, never signed. */
+const weiAmount = z.string().regex(/^[0-9]+$/, "expected a base-10 integer string in wei");
+
+/**
+ * On-chain SPOT leg (2026-09-08): a token bought or sold against a quote asset
+ * on a curve or AMM, filled immediately. It has no outcome and no bounded unit
+ * price, so it is NOT expressed through the prediction legs — squeezing a
+ * BNB-denominated price into `priceUsd ∈ (0, 1)` would falsify the audit log.
+ * `market` is `${venue}:${baseAddressLowercase}`, so the existing exact-match
+ * allowlist works unchanged. Sizing is still not policy here: `amountInWei`
+ * and `minAmountOutWei` are carried for idempotency and audit only.
+ */
+const spotLeg = {
+  kind: z.literal("spot"),
+  agentId: z.string().min(1),
+  /** Idempotency key; one signature per (agentId, clientOrderId), ever. */
+  clientOrderId: z.string().min(1),
+  market: z.string().min(1),
+  chainId: z.number().int().positive(),
+  venue: z.enum(["fourmeme", "paper-meme"]),
+  /** Token bought (BUY) or sold (SELL). */
+  base: evmAddress,
+  /** Quote asset; "native" is the chain's gas coin (BNB on 56). */
+  quote: z.union([evmAddress, z.literal("native")]),
+  /** BUY: quote to spend; SELL: base units to sell. */
+  amountInWei: weiAmount,
+  /** Slippage floor the venue must honour. */
+  minAmountOutWei: weiAmount,
+};
+
+export const SpotOrderIntentSchema = z.discriminatedUnion("side", [
+  z.object({ ...spotLeg, side: z.literal("BUY") }).strict(),
+  z.object({ ...spotLeg, side: z.literal("SELL") }).strict(),
+]);
+
+// Spot first: both unions discriminate on `side`, so a `kind: "spot"` payload
+// would otherwise surface a prediction-leg error ("outcome required"). There is
+// no ambiguity either way — the prediction legs are `.strict()` and reject `kind`.
+export const OrderIntentSchema = z.union([SpotOrderIntentSchema, PredictionOrderIntentSchema]);
+
+export type PredictionOrderIntent = z.infer<typeof PredictionOrderIntentSchema>;
+export type SpotOrderIntent = z.infer<typeof SpotOrderIntentSchema>;
 export type OrderIntent = z.infer<typeof OrderIntentSchema>;
 
 export interface AgentSigningAuthorization {
@@ -412,7 +455,25 @@ function hashOrder(order: OrderIntent): string {
   // quantity slot is side-specific (sizeUsd for BUY, shares for SELL); `side`
   // is part of the canonical form, so a BUY and a SELL that happen to share a
   // numeric quantity can never collide, and the replay-conflict check works
-  // per-variant.
+  // per-variant. The prediction tuple is byte-identical to pre-1.1.0, so
+  // existing ledgers keep matching; the spot tuple leads with its `kind` so the
+  // two leg families can never collide.
+  if ("kind" in order) {
+    const canonical = JSON.stringify([
+      order.kind,
+      order.agentId,
+      order.clientOrderId,
+      order.market,
+      order.chainId,
+      order.venue,
+      order.base,
+      order.quote,
+      order.side,
+      order.amountInWei,
+      order.minAmountOutWei,
+    ]);
+    return createHash("sha256").update(canonical).digest("hex");
+  }
   const quantity = order.side === "BUY" ? order.sizeUsd : order.shares;
   const canonical = JSON.stringify([
     order.agentId,
