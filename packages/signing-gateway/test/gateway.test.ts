@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { OrderIntentSchema, PolicyStampSigner, SigningGateway } from "../src/index.js";
+import {
+  OrderIntentSchema,
+  PolicyStampSigner,
+  PredictionOrderIntentSchema,
+  SigningGateway,
+  SpotOrderIntentSchema,
+} from "../src/index.js";
 
 type BuyOverrides = Partial<{
   agentId: string;
@@ -292,6 +298,109 @@ describe("SigningGateway", () => {
     expect(
       await gateway.signOrder(order({ agentId: "alice bob", clientOrderId: "sell-1" })),
     ).toMatchObject({ ok: true, replay: false });
+  });
+});
+
+const BASE = "0x" + "ab".repeat(20);
+
+/** A well-formed spot BUY: spend `amountInWei` of native BNB for BASE. */
+function spotOrder(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    kind: "spot",
+    agentId: "a1",
+    clientOrderId: "sp-1",
+    market: `fourmeme:${BASE}`,
+    chainId: 56,
+    venue: "fourmeme",
+    base: BASE,
+    quote: "native",
+    side: "BUY",
+    amountInWei: "100000000000000000",
+    minAmountOutWei: "1",
+    ...overrides,
+  };
+}
+
+describe("SigningGateway spot leg (v1.1.0)", () => {
+  it("signs a spot BUY and a spot SELL from an authorized agent", async () => {
+    const gateway = makeGateway();
+    expect(await gateway.signOrder(spotOrder())).toMatchObject({ ok: true, replay: false, clientOrderId: "sp-1" });
+    expect(
+      await gateway.signOrder(
+        spotOrder({ clientOrderId: "sp-2", side: "SELL", amountInWei: "5000", minAmountOutWei: "1" }),
+      ),
+    ).toMatchObject({ ok: true, replay: false, clientOrderId: "sp-2" });
+  });
+
+  it("replays an identical spot order and rejects clientOrderId reuse with different content", async () => {
+    const gateway = makeGateway();
+    const first = await gateway.signOrder(spotOrder());
+    const again = await gateway.signOrder(spotOrder());
+    if (!first.ok || !again.ok) throw new Error("unreachable");
+    expect(again).toMatchObject({ replay: true, signature: first.signature });
+    expect(await gateway.signOrder(spotOrder({ minAmountOutWei: "2" }))).toMatchObject({
+      ok: false,
+      code: "idempotency_conflict",
+    });
+    expect(await gateway.signOrder(spotOrder({ side: "SELL" }))).toMatchObject({
+      ok: false,
+      code: "idempotency_conflict",
+    });
+  });
+
+  it("accepts an ERC-20 quote as well as \"native\"", () => {
+    const quote = "0x" + "cd".repeat(20);
+    expect(OrderIntentSchema.safeParse(spotOrder({ quote })).success).toBe(true);
+    expect(OrderIntentSchema.safeParse(spotOrder({ quote: "native" })).success).toBe(true);
+    expect(OrderIntentSchema.safeParse(spotOrder({ quote: "BNB" })).success).toBe(false);
+  });
+
+  it("rejects malformed spot legs structurally", async () => {
+    const gateway = makeGateway();
+    const attempts: unknown[] = [
+      // prediction fields never belong on a spot leg — no priceUsd smuggling
+      spotOrder({ priceUsd: 0.5 }),
+      spotOrder({ sizeUsd: 10 }),
+      spotOrder({ outcome: "YES" }),
+      // wei amounts are base-10 integer strings only
+      spotOrder({ amountInWei: "1.5" }),
+      spotOrder({ amountInWei: "-1" }),
+      spotOrder({ minAmountOutWei: "0x10" }),
+      spotOrder({ amountInWei: 100 }),
+      // addresses are 20-byte hex
+      spotOrder({ base: "0x1234" }),
+      spotOrder({ venue: "binance" }),
+      spotOrder({ chainId: 0 }),
+      spotOrder({ chainId: 56.5 }),
+      spotOrder({ side: "HOLD" }),
+      // a prediction leg cannot carry `kind`
+      { ...order(), kind: "spot" },
+      { ...order(), kind: "prediction" },
+    ];
+    for (const attempt of attempts) {
+      expect(await gateway.signOrder(attempt)).toMatchObject({ ok: false, code: "invalid_request" });
+    }
+  });
+
+  it("applies the market allowlist to `${venue}:${base}` exactly", async () => {
+    const gateway = makeGateway();
+    gateway.authorizeAgent({ agentId: "a4", allowedMarkets: [`fourmeme:${BASE}`] });
+    expect(await gateway.signOrder(spotOrder({ agentId: "a4" }))).toMatchObject({ ok: true });
+    expect(
+      await gateway.signOrder(
+        spotOrder({ agentId: "a4", clientOrderId: "sp-9", market: `fourmeme:0x${"ef".repeat(20)}` }),
+      ),
+    ).toMatchObject({ ok: false, code: "market_not_allowed" });
+  });
+
+  it("keeps the prediction legs byte-compatible and exposes both leg schemas", () => {
+    const parsed = OrderIntentSchema.safeParse(order());
+    if (!parsed.success) throw new Error("unreachable");
+    expect(parsed.data).toEqual({ ...order(), orderType: "GTC" });
+    expect(parsed.data).not.toHaveProperty("kind");
+    expect(PredictionOrderIntentSchema.safeParse(spotOrder()).success).toBe(false);
+    expect(SpotOrderIntentSchema.safeParse(order()).success).toBe(false);
+    expect(SpotOrderIntentSchema.safeParse(spotOrder()).success).toBe(true);
   });
 });
 
