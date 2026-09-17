@@ -100,7 +100,11 @@ const spotLeg = {
   clientOrderId: z.string().min(1),
   market: z.string().min(1),
   chainId: z.number().int().positive(),
-  venue: z.enum(["fourmeme", "paper-meme"]),
+  // The spot venues neotrade ships: four.meme and flap (both BSC launchpads,
+  // 2026-09-17) plus the paper twin that mirrors either. A venue absent here
+  // fails closed at the schema, which is the point — a new executor cannot
+  // sign anything until this list says so.
+  venue: z.enum(["fourmeme", "flap", "paper-meme"]),
   /** Token bought (BUY) or sold (SELL). */
   base: evmAddress,
   /** Quote asset; "native" is the chain's gas coin (BNB on 56). */

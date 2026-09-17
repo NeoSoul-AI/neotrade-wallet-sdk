@@ -322,6 +322,15 @@ function spotOrder(overrides: Record<string, unknown> = {}): Record<string, unkn
 }
 
 describe("SigningGateway spot leg (v1.1.0)", () => {
+  it("accepts every shipped spot venue and refuses one it has never heard of (v1.1.1: flap)", async () => {
+    const gateway = makeGateway();
+    for (const [i, venue] of ["fourmeme", "flap", "paper-meme"].entries()) {
+      expect(await gateway.signOrder(spotOrder({ clientOrderId: `sp-v${i}`, venue, market: `${venue}:${BASE}` }))).toMatchObject({ ok: true });
+    }
+    const unknown = await gateway.signOrder(spotOrder({ clientOrderId: "sp-vx", venue: "brew", market: `brew:${BASE}` }));
+    expect(unknown.ok).toBe(false);
+  });
+
   it("signs a spot BUY and a spot SELL from an authorized agent", async () => {
     const gateway = makeGateway();
     expect(await gateway.signOrder(spotOrder())).toMatchObject({ ok: true, replay: false, clientOrderId: "sp-1" });
