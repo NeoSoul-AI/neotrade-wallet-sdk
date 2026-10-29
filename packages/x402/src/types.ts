@@ -46,4 +46,8 @@ export interface SignedPayment {
 export interface ChainEndpoint {
   rpcUrl: string;
   chainId: number;
+  /** Tried in order when `rpcUrl` fails at the transport (unreachable,
+   * timeout). Caller-supplied like `rpcUrl` itself — the package still ships
+   * no endpoint of its own. */
+  fallbackRpcUrls?: readonly string[];
 }

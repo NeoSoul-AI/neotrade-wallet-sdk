@@ -1,6 +1,6 @@
-import { createPublicClient, createWalletClient, encodeFunctionData, http, type Hex } from "viem";
+import { createPublicClient, createWalletClient, encodeFunctionData, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { chainOf } from "./permit2.js";
+import { chainOf, transportOf } from "./permit2.js";
 import type { ChainEndpoint } from "./types.js";
 
 /**
@@ -195,7 +195,7 @@ export async function quoteSwapNativeForErc20(
 ): Promise<{ amountOut: bigint }> {
   assertFee(params.fee);
   assertAmountIn(params.amountInWei);
-  const pc = createPublicClient({ transport: http(e.rpcUrl) });
+  const pc = createPublicClient({ transport: transportOf(e) });
   const { result } = await pc.simulateContract({
     address: params.quoter,
     abi: QUOTER_V2,
@@ -247,8 +247,8 @@ export async function swapNativeForErc20(
   }
   const account = privateKeyToAccount(privateKey);
   const chain = chainOf(e);
-  const wc = createWalletClient({ account, chain, transport: http(e.rpcUrl) });
-  const pc = createPublicClient({ chain, transport: http(e.rpcUrl) });
+  const wc = createWalletClient({ account, chain, transport: transportOf(e) });
+  const pc = createPublicClient({ chain, transport: transportOf(e) });
   const data = encodeExactInputSingle({
     tokenIn: params.tokenIn,
     tokenOut: params.tokenOut,
@@ -447,7 +447,7 @@ export async function quoteSwapNativeForErc20ExactOut(
 ): Promise<{ amountIn: bigint }> {
   assertFee(params.fee);
   assertAmountOut(params.amountOut);
-  const pc = createPublicClient({ transport: http(e.rpcUrl) });
+  const pc = createPublicClient({ transport: transportOf(e) });
   const { result } = await pc.simulateContract({
     address: params.quoter,
     abi: QUOTER_V2_EXACT_OUT,
@@ -495,8 +495,8 @@ export async function swapNativeForErc20ExactOut(
   }
   const account = privateKeyToAccount(privateKey);
   const chain = chainOf(e);
-  const wc = createWalletClient({ account, chain, transport: http(e.rpcUrl) });
-  const pc = createPublicClient({ chain, transport: http(e.rpcUrl) });
+  const wc = createWalletClient({ account, chain, transport: transportOf(e) });
+  const pc = createPublicClient({ chain, transport: transportOf(e) });
   const data = encodeExactOutMulticall({
     tokenIn: params.tokenIn,
     tokenOut: params.tokenOut,

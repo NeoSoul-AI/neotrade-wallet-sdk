@@ -1,6 +1,6 @@
-import { createPublicClient, createWalletClient, encodeFunctionData, getAddress, http, type Hex } from "viem";
+import { createPublicClient, createWalletClient, encodeFunctionData, getAddress, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { chainOf } from "./permit2.js";
+import { chainOf, transportOf } from "./permit2.js";
 import type { ChainEndpoint } from "./types.js";
 
 /**
@@ -64,8 +64,8 @@ async function send(
 ): Promise<{ txHash: Hex }> {
   const account = privateKeyToAccount(privateKey);
   const chain = chainOf(e);
-  const wc = createWalletClient({ account, chain, transport: http(e.rpcUrl) });
-  const pc = createPublicClient({ chain, transport: http(e.rpcUrl) });
+  const wc = createWalletClient({ account, chain, transport: transportOf(e) });
+  const pc = createPublicClient({ chain, transport: transportOf(e) });
   // A throw ABOVE this line means nothing was broadcast: plain error, the
   // caller may record `failed` and safely retry.
   const txHash = await wc.sendTransaction(tx);
@@ -156,7 +156,7 @@ export async function transferNative(
  * helper (`encodeErc20Transfer`); covered by the manual testnet pass.
  */
 export async function estimateNativeTransferGasCost(e: ChainEndpoint): Promise<bigint> {
-  const pc = createPublicClient({ transport: http(e.rpcUrl) });
+  const pc = createPublicClient({ transport: transportOf(e) });
   let maxFeePerGas: bigint;
   try {
     ({ maxFeePerGas } = await pc.estimateFeesPerGas());
