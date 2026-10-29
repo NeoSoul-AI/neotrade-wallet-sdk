@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, http, type Chain, type Hex } from "viem";
+import { createPublicClient, createWalletClient, fallback, http, type Chain, type Hex, type Transport } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { createPermit2ApprovalTx, getPermit2AllowanceReadParams } from "@x402/evm/exact/client";
 import type { ChainEndpoint } from "./types.js";
@@ -25,12 +25,23 @@ export function chainOf(e: ChainEndpoint): Chain {
     id: e.chainId,
     name: `eip155:${e.chainId}`,
     nativeCurrency: { name: "native", symbol: "NATIVE", decimals: 18 },
-    rpcUrls: { default: { http: [e.rpcUrl] } },
+    rpcUrls: { default: { http: [e.rpcUrl, ...(e.fallbackRpcUrls ?? [])] } },
   };
 }
 
+/** `rpcUrl` alone, or `rpcUrl` then each fallback in order. viem moves to the
+ * next node on any failure except a revert or a rejection, so a send can reach
+ * a second node — with the same signed bytes, hence the same tx hash: a resend,
+ * never a second payment. Each node is tried once (`retryCount: 0`): fallback's
+ * default retries the whole list 3 more times, which with every node blackholed
+ * would hold a read for minutes; one pass keeps the worst case at N timeouts. */
+export function transportOf(e: ChainEndpoint): Transport {
+  const urls = [e.rpcUrl, ...(e.fallbackRpcUrls ?? [])];
+  return urls.length === 1 ? http(e.rpcUrl) : fallback(urls.map((url) => http(url)), { retryCount: 0 });
+}
+
 export async function readPermit2Allowance(e: ChainEndpoint, asset: Hex, owner: Hex): Promise<bigint> {
-  const pc = createPublicClient({ transport: http(e.rpcUrl) });
+  const pc = createPublicClient({ transport: transportOf(e) });
   return (await pc.readContract(
     getPermit2AllowanceReadParams({ tokenAddress: asset, ownerAddress: owner }),
   )) as bigint;
@@ -39,12 +50,12 @@ export async function readPermit2Allowance(e: ChainEndpoint, asset: Hex, owner: 
 /** decimals() from the CONTRACT, never assumed. mUSDC is 18, not the 6 that the
  * name "USDC" implies — assuming 6 misreads a balance by 10^12. */
 export async function readDecimals(e: ChainEndpoint, asset: Hex): Promise<number> {
-  const pc = createPublicClient({ transport: http(e.rpcUrl) });
+  const pc = createPublicClient({ transport: transportOf(e) });
   return Number(await pc.readContract({ address: asset, abi: ERC20_READ, functionName: "decimals" }));
 }
 
 export async function readErc20Balance(e: ChainEndpoint, asset: Hex, owner: Hex): Promise<bigint> {
-  const pc = createPublicClient({ transport: http(e.rpcUrl) });
+  const pc = createPublicClient({ transport: transportOf(e) });
   return (await pc.readContract({
     address: asset,
     abi: ERC20_READ,
@@ -54,7 +65,7 @@ export async function readErc20Balance(e: ChainEndpoint, asset: Hex, owner: Hex)
 }
 
 export async function readNativeBalance(e: ChainEndpoint, owner: Hex): Promise<bigint> {
-  return createPublicClient({ transport: http(e.rpcUrl) }).getBalance({ address: owner });
+  return createPublicClient({ transport: transportOf(e) }).getBalance({ address: owner });
 }
 
 /**
@@ -73,8 +84,8 @@ export async function approvePermit2(
 ): Promise<{ txHash: Hex }> {
   const account = privateKeyToAccount(privateKey);
   const chain = chainOf(e);
-  const wc = createWalletClient({ account, chain, transport: http(e.rpcUrl) });
-  const pc = createPublicClient({ chain, transport: http(e.rpcUrl) });
+  const wc = createWalletClient({ account, chain, transport: transportOf(e) });
+  const pc = createPublicClient({ chain, transport: transportOf(e) });
   const tx = createPermit2ApprovalTx(asset);
   const txHash = await wc.sendTransaction({ to: tx.to, data: tx.data });
   const receipt = await pc.waitForTransactionReceipt({ hash: txHash });
